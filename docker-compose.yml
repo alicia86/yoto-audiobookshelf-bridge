@@ -1,0 +1,13 @@
+# Run next to Audiobookshelf. If ABS is in another compose project, either put both on one
+# Docker network and use abs_url: http://audiobookshelf:80, or use the host's LAN IP and ABS's port.
+services:
+  yoto-bridge:
+    build: .
+    container_name: yoto-bridge
+    restart: unless-stopped
+    ports:
+      - "8090:8080"          # host port 8090 -> bridge 8080 in the container. Phone page: http://<host-ip>:8090
+                             # Yotos fetch audio from public_url (LAN, or a public address forwarding /s/; see README).
+    volumes:
+      - ./data:/data         # config.yaml, Yoto login tokens, card assignments
+    stop_grace_period: 20s   # time to write final positions to ABS on shutdown

@@ -1,0 +1,3 @@
+aiohttp==3.14.4
+pyyaml>=6.0
+yoto-api==4.5.1

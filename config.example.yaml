@@ -1,0 +1,50 @@
+# Copy to ./data/config.yaml and fill in the first four values.
+
+# Audiobookshelf key. ABS 2.26+: Settings -> Users -> "API Keys" tab. Older ABS: Settings -> Users -> the user -> API Token.
+# Progress is saved to whichever ABS user owns this key, so use the account whose
+# "Continue listening" you want the Yoto to share: the one logged in on the phone.
+abs_url: http://192.168.1.20:13378          # your ABS server as this host reaches it
+abs_api_key: "paste-abs-api-key"
+
+# How the Yotos reach this bridge's audio (/s/...). Every player uses the same URLs.
+# Players on this network: this host's LAN IP and port, as below. Not localhost, not a .local name.
+# Players on other networks: a public HTTPS address that forwards /s/ to this bridge, e.g.
+# https://yoto.example.com (see README "Publishing /s/ for players on other networks").
+public_url: http://192.168.1.20:8090
+
+# Yoto developer client id: dashboard.yoto.dev -> create app, type Public Client (no secret).
+# Add <public_url>/s/yoto-callback under Allowed Callback URLs, e.g.
+# https://yoto.example.com/s/yoto-callback
+yoto_client_id: "paste-yoto-client-id"
+
+# ---- optional ----
+# library_ids: [lib_xxxxxxxx]   # only show these ABS libraries on the phone page
+# yoto_redirect_uri: http://127.0.0.1:8787/callback   # only if you cannot use the default above; see README
+# chapter_tracks: true           # one Yoto track per chapter: the player's next/previous skip chapters
+# chapter_icons: true            # cover + chapter number on the Yoto's display (offline copies need the user:icons:manage scope)
+# offline_hours: 5               # how much of a book "Make offline" puts on the card (Yoto max 5)
+# chapters_api_key: "key-of-an-ABS-user-who-may-edit-books"   # Chapters tab: needed if abs_api_key's user can't edit
+# audible_region: us            # Chapters tab: Audible store for chapter lists (us, uk, ca, au, de, fr, it, es, jp, in)
+# ui_pin: "4321"                # PIN for making/changing cards on the phone page
+# bitrate_kbps: 64              # mono 64 kbps MP3 is plenty for speech
+# rewind_seconds: 5             # back up this much on every resume
+# warm_start_seconds: 30        # first seconds of each card kept encoded for a fast start (0 = off)
+
+# Push alerts when something breaks (README "Alerts when something breaks"):
+# ntfy_url: https://ntfy.sh/a-long-random-topic-name
+# ntfy_token: ""                 # only for a protected topic on your own ntfy server
+# alert_check_public: true       # false if this host cannot reach its own public_url
+
+# Per-player overrides. Device ids are printed in the bridge log at startup.
+# devices:
+#   y23xxxxxxxxx:
+#     name: Mini
+#     abs_api_key: "key-of-a-different-ABS-user"   # only if this player should use another ABS account
+#     ip: 192.168.1.51                             # optional, players on this network only: recognises the player before its first event
+#   y24xxxxxxxxx:
+#     name: Player
+
+# ---- switches for the points your tests decide (see README) ----
+# resume_mode: server                         # or seconds_in
+# event_position: relative                    # or absolute
+# card_uri_format: "https://yoto.io/{card_id}"

@@ -1,0 +1,1028 @@
+"""HTTP server: the stream endpoint the Yoto players fetch, the JSON API behind the phone page,
+and the wiring between ABS, Yoto and the playback manager."""
+from __future__ import annotations
+
+import asyncio
+import html
+import logging
+import time
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+
+import aiohttp
+from aiohttp import web
+
+from .abs_client import ABSClient, ABSError
+from .alerts import Alerts
+from . import chapter_api
+from . import transfer
+from . import chapters as chapter_tracks
+from . import icons
+from .offline import OfflineManager
+from .series import CollectionIndex, _series_entries, group_books
+from .config import Config
+from .playback import PlaybackManager
+from .store import Store
+from .streamer import Encoder
+from .yoto import YotoAPI, YotoAuth, YotoControl, YotoLoginError, YotoNotLoggedIn
+
+log = logging.getLogger(__name__)
+STATIC = Path(__file__).parent / "static"
+BRIDGE = web.AppKey("bridge", object)
+# Under /s/ so whatever publishes the streams (a proxy or tunnel forwarding /s/) also carries the Yoto login redirect.
+CALLBACK_PATH = "/s/yoto-callback"
+
+
+class Bridge:
+    def __init__(self, cfg: Config, http: aiohttp.ClientSession, control_factory=None):
+        self.cfg = cfg
+        self.http = http
+        self.store = Store(cfg.data_dir)
+        self.abs = ABSClient(http, cfg.abs_url, cfg.abs_api_key)
+        self.encoder = Encoder(cfg.bitrate_kbps, cfg.channels, cfg.sample_rate)
+        self.auth = YotoAuth(http, cfg.yoto_client_id, cfg.yoto_login, cfg.yoto_api,
+                             Path(cfg.data_dir) / "yoto_tokens.json",
+                             redirect_uri=cfg.yoto_redirect_uri or f"{cfg.public_url}{CALLBACK_PATH}")
+        self.yoto = YotoAPI(http, self.auth, cfg.yoto_api)
+        self.pm = PlaybackManager(cfg, self.abs, self.store)
+        factory = control_factory or (lambda: YotoControl(self.auth, cfg.card_uri_format, self.on_yoto_event))
+        self.control = factory()
+        self.pm.control = self.control
+        self.pm.encoder = self.encoder
+        self.pm.known_devices = lambda: [d["deviceId"] for d in self.yoto_devices]
+        self.pm.on_finished = lambda slot_id: self.pm._bg(self.relayout(slot_id))
+        self.offline = OfflineManager(self)
+        self.collection_index = CollectionIndex(self.abs)
+        self.alerts = Alerts(self)
+        self.yoto_devices: list[dict] = []
+        self._cover16: dict[str, bytes | None] = {}
+        self._chapters: dict[str, list] = {}
+        self._durations: dict[str, float] = {}
+        self.seeking: set[str] = set()
+        self.jumping: dict[str, tuple[int, float]] = {}   # slot -> (track the player was told to start, when)
+        self.icon_upload_error = ""
+        self.last_error = ""
+        self.transfer = None                # old MYO card -> ABS (transfer.py), set by make_app
+
+    def stream_url(self, slot: str) -> str:
+        return f"{self.cfg.public_url}/s/{slot}.mp3"
+
+    def chapter_mode(self, slot) -> bool:
+        return bool(self.cfg.chapter_tracks and self.cfg.resume_mode == "server" and slot.item_id)
+
+    def playlist_url(self, slot) -> str:
+        """What slot.stream_url should be: the single stream, or (chapter tracks) the slot's track prefix."""
+        return f"{self.cfg.public_url}/s/{slot.slot}/" if self.chapter_mode(slot) else self.stream_url(slot.slot)
+
+    def icon_url(self, slot: str) -> str:
+        return f"{self.cfg.public_url}/s/icon/{slot}.png" if self.cfg.chapter_icons else ""
+
+    # ---------------- chapter icons ----------------
+
+    async def chapters(self, item_id: str) -> list:
+        if item_id not in self._chapters:
+            item = await self.abs.item(item_id)
+            self._chapters[item_id] = item.get("media", {}).get("chapters") or []
+            self._durations[item_id] = float(item.get("media", {}).get("duration") or 0)
+        return self._chapters[item_id]
+
+    async def book_info(self, item_id: str) -> tuple[float, list]:
+        chapters = await self.chapters(item_id)
+        return self._durations.get(item_id, 0.0), chapters
+
+    # ---------------- chapters as tracks ----------------
+
+    async def build_layout(self, slot) -> list:
+        key = self.cfg.abs_key_for(slot.device_id)
+        following = await self.pm.resolve_series(slot, key) if slot.series_id else []
+        prog = await self.abs.progress(slot.item_id, key) or {}
+        duration, chapters = await self.book_info(slot.item_id)
+        pos = float(prog.get("currentTime") or 0)
+        if prog.get("isFinished") or (duration and pos >= duration - 10):
+            pos = 0.0
+        books = [(slot.item_id, slot.title, duration, chapters, pos)]
+        for b in following[:20]:
+            d, ch = await self.book_info(b.item_id)
+            books.append((b.item_id, b.title, d or b.duration, ch, 0.0))
+        return chapter_tracks.make_layout(books, self.cfg.part_seconds)
+
+    def track_title(self, seg, multi_book: bool) -> str:
+        label = f"{seg.number}. {seg.title}" if seg.chaptered and not seg.title.lower().startswith(("chapter", "part")) else seg.title
+        return f"{seg.book}: {label}" if multi_book else label
+
+    async def relayout(self, slot_id: str):
+        """After a listen: rewrite the card's track list so track 1 is the chapter the listener is in now."""
+        slot = self.store.get(slot_id)
+        if (not slot or not slot.yoto_card_id or slot.offline or not self.chapter_mode(slot)
+                or slot.slot in self.pm.by_slot or slot.slot in self.seeking):
+            return
+        try:
+            if chapter_tracks.same_layout(slot, await self.build_layout(slot)):
+                return                               # same book(s): keep the numbering the player remembers
+            await self.save_playlist(slot, cover=False)
+        except Exception as e:
+            log.warning("could not update the chapter tracks of %s: %s", slot.title or slot.slot, e)
+
+    async def icon_png(self, item_id: str, pos: float | None) -> bytes:
+        if item_id not in self._cover16:
+            try:
+                self._cover16[item_id] = await icons.shrink_cover(await self.abs.cover(item_id))
+            except ABSError:
+                self._cover16[item_id] = None
+        number = icons.chapter_number(await self.chapters(item_id), pos) if pos is not None else None
+        return icons.render(self._cover16[item_id], number)
+
+    async def uploaded_icon(self, item_id: str, pos: float) -> str | None:
+        """An uploaded Yoto icon for the chapter at pos (for offline copies), reused across copies.
+        None when uploads are not allowed (the Yoto app lacks the user:icons:manage scope)."""
+        if not self.cfg.chapter_icons or self.icon_upload_error:
+            return None
+        number = icons.chapter_number(await self.chapters(item_id), pos)
+        key = f"{icons.STYLE}:{item_id}:{number or 0}"   # a new icon style uploads afresh
+        if key not in self.store.state.icons:
+            try:
+                ref = await self.yoto.upload_icon(await self.icon_png(item_id, pos), f"abs-{item_id[:8]}-{number or 0}")
+            except Exception as e:
+                self.icon_upload_error = str(e)[:200]
+                log.warning("chapter icons for offline copies are off: icon upload failed (%s). "
+                            "Add the user:icons:manage scope to the Yoto app and press Connect Yoto again.", e)
+                return None
+            self.store.state.icons[key] = ref
+            self.store.save()
+        return self.store.state.icons[key]
+
+    async def connect_yoto(self):
+        """After login (or at startup): find the players, connect MQTT, make one remote playlist per player."""
+        try:
+            self.yoto_devices = await self.yoto.devices()
+            ids = [d["deviceId"] for d in self.yoto_devices]
+            for d in self.yoto_devices:
+                log.info("Yoto player %s: %s (online=%s)", d["deviceId"], d.get("name"), d.get("online"))
+            for d in self.yoto_devices:
+                await self.ensure_remote_slot(d["deviceId"], d.get("name") or d["deviceId"])
+            await self.refresh_playlist_urls()
+            if ids:
+                await self.control.connect(ids)
+            self.last_error = ""
+        except YotoNotLoggedIn:
+            pass
+        except Exception as e:
+            self.last_error = f"Yoto connect failed: {e}"
+            log.exception("Yoto connect failed")
+
+    async def save_playlist(self, slot, cover: bool = True):
+        """Write a slot's Yoto playlist: title, stream URL(s) and (for cards) the ABS cover."""
+        title = (slot.series_name or slot.title) if slot.kind == "card" else slot.yoto_title
+        cover_url = await self.cover_for_yoto(slot.item_id) if (cover and slot.kind == "card" and slot.item_id) else None
+        description = ("" if slot.kind == "card" else
+                       "Used by the Yoto bridge to play any Audiobookshelf book on this player. No card needed.")
+        if self.chapter_mode(slot):
+            segs = await self.build_layout(slot)
+            lid = chapter_tracks.store_layout(slot, segs)
+            multi = len({s.item_id for s in segs}) > 1
+            base = f"{self.cfg.public_url}/s"
+            tracks = [{"key": f"{i:02d}", "title": self.track_title(seg, multi), "url": f"{base}/{slot.slot}/{lid}/{i}.mp3",
+                       "icon_url": f"{base}/icon/{slot.slot}/{lid}/{i}.png" if self.cfg.chapter_icons else None}
+                      for i, seg in enumerate(segs, 1)]
+            slot.yoto_card_id = await self.yoto.save_stream_tracks_playlist(
+                title, tracks, card_id=slot.yoto_card_id or None, cover_url=cover_url, description=description)
+            slot.yoto_title, slot.stream_url, slot.icon_url = title, self.playlist_url(slot), self.icon_url(slot.slot)
+            self.store.save()
+            log.info("Yoto playlist %s: %d chapter tracks from %s", title, len(tracks),
+                     f"{segs[0].book} ch. {segs[0].number}" if segs else "-")
+            return
+        slot.yoto_card_id = await self.yoto.save_stream_playlist(
+            title, self.stream_url(slot.slot), card_id=slot.yoto_card_id or None, cover_url=cover_url,
+            description="" if slot.kind == "card" else
+            "Used by the Yoto bridge to play any Audiobookshelf book on this player. No card needed.",
+            icon_url=self.icon_url(slot.slot) or None)
+        slot.yoto_title, slot.stream_url, slot.icon_url = title, self.stream_url(slot.slot), self.icon_url(slot.slot)
+        self.store.save()
+
+    async def refresh_playlist_urls(self):
+        """If public_url changed (new IP, or http -> https after test a), rewrite every playlist once."""
+        for slot in list(self.store.state.slots.values()):
+            if slot.offline:
+                continue                 # holds an offline copy; the stream URL goes back on "Back to streaming"
+            if slot.yoto_card_id and slot.stream_url and (slot.stream_url != self.playlist_url(slot)
+                                                          or slot.icon_url != self.icon_url(slot.slot)):
+                log.info("updating Yoto playlist %s to %s", slot.yoto_title, self.playlist_url(slot))
+                await self.save_playlist(slot)
+            elif slot.yoto_card_id and self.chapter_mode(slot) and slot.slot not in self.pm.by_slot:
+                try:
+                    if not chapter_tracks.same_layout(slot, await self.build_layout(slot)):
+                        log.info("updating the chapter tracks of %s", slot.yoto_title)
+                        await self.save_playlist(slot, cover=False)
+                except Exception as e:
+                    log.warning("could not check the chapter tracks of %s: %s", slot.yoto_title, e)
+
+    async def ensure_remote_slot(self, device_id: str, name: str):
+        slot = self.store.remote_for(device_id)
+        if slot and slot.yoto_card_id:
+            return slot
+        slot = slot or self.store.new_slot("remote", device_id=device_id)
+        slot.yoto_title = f"Audiobookshelf on {name}"
+        await self.save_playlist(slot)
+        return slot
+
+    def on_yoto_event(self, device_id: str, ev: dict):
+        self.pm.on_event(device_id, ev)
+        self.offline.on_event(device_id, self.pm.devices.get(device_id, {}))
+        if self.transfer:
+            self.transfer.on_event(device_id, ev, self.pm.devices.get(device_id, {}))
+
+    async def cover_for_yoto(self, item_id: str) -> str | None:
+        try:
+            image = await icons.to_jpeg(await self.abs.cover(item_id))
+            if not image:
+                log.warning("cover for %s is in a format ffmpeg cannot read", item_id)
+                return None
+            return await self.yoto.upload_cover(image)
+        except Exception as e:
+            log.warning("cover for %s unavailable: %s", item_id, e)
+            return None
+
+    def device_name(self, device_id: str) -> str:
+        if device_id in self.cfg.devices and self.cfg.devices[device_id].name:
+            return self.cfg.devices[device_id].name
+        d = next((d for d in self.yoto_devices if d.get("deviceId") == device_id), None)
+        return (d or {}).get("name") or device_id
+
+
+# ---------------------------------------------------------------- stream endpoint
+
+def parse_range(header: str | None, total: int) -> tuple[int, int] | None:
+    if not header or not header.startswith("bytes="):
+        return None
+    spec = header[6:].split(",")[0].strip()
+    a, _, b = spec.partition("-")
+    if a == "":                      # suffix range: last N bytes
+        n = int(b)
+        return max(0, total - n), total - 1
+    start = int(a)
+    end = int(b) if b else total - 1
+    return start, min(end, total - 1)
+
+
+async def stream_icon(request: web.Request) -> web.Response:
+    """The 16x16 icon a streaming card's track points at: the book's cover with the number of the chapter
+    being listened to (or, when the card is idle, the chapter ABS has it at). Public wherever /s/ is published;
+    the slot id is unguessable and the icon shows nothing beyond a tiny cover and a number."""
+    br: Bridge = request.app[BRIDGE]
+    slot = br.store.get(request.match_info["slot"])
+    if not slot or not slot.item_id:
+        raise web.HTTPNotFound()
+    pb = br.pm.by_slot.get(slot.slot)
+    if pb:
+        book, pos = br.pm.book_position(pb)
+        item_id = book.item_id
+    else:
+        item_id, pos = slot.item_id, 0.0
+        try:
+            prog = await br.abs.progress(item_id, br.cfg.abs_key_for(slot.device_id)) or {}
+            pos = float(prog.get("currentTime") or 0)
+        except ABSError:
+            pass
+    body = await br.icon_png(item_id, pos)
+    return web.Response(body=body, content_type="image/png", headers={"Cache-Control": "no-cache"})
+
+
+async def stream_track_icon(request: web.Request) -> web.Response:
+    """The icon of one chapter track: the book's cover with that chapter's number (fixed per track)."""
+    br: Bridge = request.app[BRIDGE]
+    slot = br.store.get(request.match_info["slot"])
+    layout = chapter_tracks.current_layout_for(slot, request.match_info["layout"]) if slot else ""
+    try:
+        seg = chapter_tracks.segment(slot, layout, int(request.match_info["k"])) if slot else None
+    except ValueError:
+        seg = None
+    if not seg:
+        raise web.HTTPNotFound()
+    body = await br.icon_png(seg.item_id, seg.start + 0.5 if seg.chaptered else None)
+    return web.Response(body=body, content_type="image/png", headers={"Cache-Control": "max-age=86400"})
+
+
+async def stream(request: web.Request) -> web.StreamResponse:
+    """The whole book (or series) as one stream track, from the ABS position. Cards made before
+    chapter tracks, and every card when chapter_tracks is off."""
+    br: Bridge = request.app[BRIDGE]
+    slot = br.store.get(request.match_info["slot"])
+    if not slot or not slot.item_id:
+        raise web.HTTPNotFound(text="No book is assigned to this card. Assign one on the bridge page.")
+    ip = request.remote
+
+    async def head_length() -> int:
+        # Report a length without opening an ABS session.
+        device = slot.device_id or br.cfg.device_for_ip(ip) or br.pm._device_from_events(slot.yoto_card_id)
+        key = br.cfg.abs_key_for(device)
+        following = await br.pm.resolve_series(slot, key) if slot.series_id else []
+        prog = await br.abs.progress(slot.item_id, key) or {}
+        item = await br.abs.item(slot.item_id)
+        dur = float(item.get("media", {}).get("duration") or prog.get("duration") or 0) + sum(b.duration for b in following)
+        base = float(prog.get("currentTime") or 0) if br.cfg.resume_mode == "server" else 0
+        return int(max(0, dur - base) * br.cfg.byterate / br.pm.speed_for(slot, device))
+
+    return await _respond(request, br, slot, lambda start_byte: br.pm.open_stream(slot, start_byte, ip), head_length)
+
+
+async def resolve_track(br: Bridge, slot, layout_id: str, k: int) -> dict | None:
+    """What chapter track k of a layout plays now (rules in chapters.py). Returns the request for
+    open_track, or {"jump": track} when a fresh tap asked for a track other than the listener's."""
+    seg = chapter_tracks.segment(slot, layout_id, k)
+    if not seg:
+        return None
+    req = {"layout": layout_id, "track": k, "item_id": seg.item_id, "title": seg.book, "start": seg.start,
+           "end": seg.end, "book_duration": seg.book_duration}
+    pb = br.pm.by_slot.get(slot.slot)
+    pending = br.jumping.get(slot.slot)              # (track the player was told to start, when)
+    if pending and time.monotonic() - pending[1] >= 15:
+        br.jumping.pop(slot.slot, None)              # the player never followed: stop waiting for it
+        pending = None
+    if pending:
+        if pending[0] != k:
+            return {"jump": pending[0], "pending": True}   # still moving: more silence, no second command
+    elif pb and not br.pm.card_out_since_start(pb):
+        return req                                   # within a listen: next/previous/auto-advance, whole chapter
+    key = br.cfg.abs_key_for(slot.device_id or br.pm._device_from_events(slot.yoto_card_id))
+    if slot.series_id:
+        await br.pm.resolve_series(slot, key)        # the book ABS says is current
+    item = slot.item_id if slot.series_id else seg.item_id
+    prog = await br.abs.progress(item, key) or {}
+    duration, chapters = await br.book_info(item)
+    pos = float(prog.get("currentTime") or 0)
+    if prog.get("isFinished"):
+        pos = duration
+    exact = slot.slot in br.pm.exact_next            # just moved there with the phone's seek buttons: no rewind
+    start = pos if exact else br.pm._resume_point(pos, duration)
+    if item == seg.item_id and seg.start <= start < seg.end - 1:
+        br.pm.exact_next.discard(slot.slot)
+        br.jumping.pop(slot.slot, None)              # the player is where it should be
+        req["start"] = max(seg.start, start)         # a plain tap on the listener's chapter: resume
+        return req
+    right = chapter_tracks.track_for(slot, item, start) if layout_id == slot.layout_id else None
+    if right and right != k and br.control.connected and not pending:
+        log.info("%s: the player asked for track %d but the listener is in track %d; moving it there",
+                 slot.title, k, right)
+        return {"jump": right}
+    # no way to move the player (or it ignored the move): play from the listener's spot under this track
+    br.pm.exact_next.discard(slot.slot)
+    spans = chapter_tracks.chapter_spans(chapters, duration, br.cfg.part_seconds)
+    end = spans[chapter_tracks.index_at(spans, start)][1] if spans else duration
+    req.update(item_id=item, title=slot.title if slot.series_id else seg.book, start=start,
+               end=max(end, start + 1), book_duration=duration)
+    log.info("%s: track %d plays from the listener's spot at %.0fs", slot.title, k, start)
+    return req
+
+
+async def _jump(br: Bridge, slot, track: int):
+    """Tell the player that just tapped this card to start `track` instead (its card id event may
+    arrive a moment after the request for audio)."""
+    br.jumping[slot.slot] = (track, time.monotonic())
+    try:
+        device = slot.device_id
+        for _ in range(40):
+            device = device or br.pm._device_from_events(slot.yoto_card_id, within=15)
+            if device:
+                break
+            await asyncio.sleep(0.1)
+        if not device:
+            log.warning("%s: could not tell which player to move to track %d", slot.title, track)
+            return
+        br.pm.expect(device, slot.yoto_card_id)
+        await br.control.play(device, slot.yoto_card_id, None, track=track)
+    except Exception:
+        br.jumping.pop(slot.slot, None)
+        raise
+
+
+async def stream_track(request: web.Request) -> web.StreamResponse:
+    """One chapter track: /s/<slot>/<layout>/<k>.mp3."""
+    br: Bridge = request.app[BRIDGE]
+    slot = br.store.get(request.match_info["slot"])
+    try:
+        k = int(request.match_info["k"])
+    except ValueError:
+        raise web.HTTPNotFound()
+    if not slot:
+        raise web.HTTPNotFound()
+    layout = chapter_tracks.current_layout_for(slot, request.match_info["layout"])
+    if layout != request.match_info["layout"]:
+        log.info("%s: player asked for an old track list (%s); serving the current one", slot.title,
+                 request.match_info["layout"])
+    req = await resolve_track(br, slot, layout, k)
+    if not req:
+        raise web.HTTPNotFound(text="This track list is out of date; take the card out and put it back in.")
+    if "jump" in req:
+        # a few seconds of silence while the player is moved to the right track; only a real request for
+        # audio sends the move (the player probes each track with HEAD first)
+        silence = (await br.encoder.silence()) * 20
+        if request.method == "HEAD":
+            return web.Response(headers={"Content-Type": "audio/mpeg", "Content-Length": str(len(silence)),
+                                         "Accept-Ranges": "bytes", "Cache-Control": "no-store"})
+        if not req.get("pending"):
+            br.jumping[slot.slot] = (req["jump"], time.monotonic())
+            br.pm._bg(_jump(br, slot, req["jump"]))
+        return web.Response(body=silence, content_type="audio/mpeg", headers={"Cache-Control": "no-store"})
+    ip = request.remote
+
+    async def head_length() -> int:
+        speed = br.pm.speed_for(slot, slot.device_id or br.pm._device_from_events(slot.yoto_card_id))
+        return int(max(0.0, req["end"] - req["start"]) * br.cfg.byterate / speed)
+
+    return await _respond(request, br, slot, lambda start_byte: br.pm.open_track(slot, start_byte, ip, req), head_length)
+
+
+async def _respond(request, br: Bridge, slot, opener, head_length) -> web.StreamResponse:
+    t0 = time.monotonic()
+    ip = request.remote
+    log.info("%s %s from %s range=%s", request.method, request.path, ip, request.headers.get("Range"))
+    headers = {"Content-Type": "audio/mpeg", "Accept-Ranges": "bytes", "Cache-Control": "no-store"}
+
+    if request.method == "HEAD":
+        headers["Content-Length"] = str(await head_length())
+        return web.Response(headers=headers)
+
+    total_guess = 10**12
+    rng = parse_range(request.headers.get("Range"), total_guess)
+    start_byte = rng[0] if rng else 0
+    if request.headers.get("Range", "").startswith("bytes=-"):
+        start_byte = 1                      # suffix probe (e.g. for an ID3v1 tag): never a restart
+    try:
+        pb, start_sec = await opener(start_byte)
+    except ABSError as e:
+        log.error("ABS refused playback: %s", e)
+        br.alerts.play_failed(slot.series_name or slot.title or slot.yoto_title or slot.slot, f"Audiobookshelf refused it: {e}")
+        raise web.HTTPBadGateway(text=str(e))
+    except Exception as e:
+        log.exception("could not start %s", slot.slot)
+        br.alerts.play_failed(slot.series_name or slot.title or slot.yoto_title or slot.slot, f"{type(e).__name__}: {e}")
+        raise
+    total = br.pm.length_bytes(pb)
+    if rng:
+        rng = parse_range(request.headers.get("Range"), total)
+        if rng[0] >= total:
+            br.pm.close_stream(pb)
+            return web.Response(status=416, headers={"Content-Range": f"bytes */{total}"})
+        n = rng[1] - rng[0] + 1
+        end_sec = pb.base + (rng[1] + 1) / br.pm.rate(pb)
+        resp = web.StreamResponse(status=206, headers={**headers, "Content-Range": f"bytes {rng[0]}-{rng[1]}/{total}"})
+    else:
+        n = total
+        end_sec = pb.duration
+        resp = web.StreamResponse(status=200, headers=headers)
+    resp.content_length = n
+    main = start_byte == 0
+    try:
+        await resp.prepare(request)
+        src = br.pm.audio(br.encoder, pb, start_sec, end_sec)
+        first = main
+        async for chunk in br.encoder.exact(src, n):
+            await resp.write(chunk)
+            br.pm.on_bytes(pb, len(chunk), main)
+            if first:
+                first = False
+                log.info("%s: first audio sent %.2fs after the request%s", pb.title or slot.slot,
+                         time.monotonic() - t0, " (warm start)" if pb.warm else "")
+        await resp.write_eof()
+    except ConnectionResetError:
+        log.info("player closed the stream for %s after %d bytes", slot.slot, pb.main_bytes)
+    finally:
+        br.pm.close_stream(pb)
+    return resp
+
+
+# ---------------------------------------------------------------- JSON API for the phone page
+
+def require_pin(request: web.Request):
+    pin = request.app[BRIDGE].cfg.ui_pin
+    if pin and request.headers.get("X-Pin") != pin:
+        raise web.HTTPUnauthorized(text="PIN required")
+
+
+async def api_status(request):
+    br: Bridge = request.app[BRIDGE]
+    devices = []
+    for d in br.yoto_devices:
+        did = d["deviceId"]
+        ev = br.pm.devices.get(did, {})
+        pb = next((p for p in br.pm.by_slot.values() if p.device_id == did), None)
+        book, at = br.pm.book_position(pb) if pb else (None, None)
+        devices.append({"id": did, "name": br.device_name(did), "online": d.get("online"),
+                        "status": ev.get("playbackStatus"),
+                        "now_playing": book.title if pb else None, "item_id": book.item_id if pb else None,
+                        "position": round(at) if pb else None,
+                        "duration": round(book.duration) if pb else None,
+                        "speed": float(br.store.state.speeds.get(did, 1.0)),
+                        "playing_speed": pb.speed if pb else None})
+    return web.json_response({
+        "yoto_logged_in": br.auth.logged_in, "yoto_client_id_set": bool(br.cfg.yoto_client_id),
+        "login_pending": br.auth.pending if br.auth.pending and br.auth.pending["expires_at"] > time.time() else None, "mqtt": br.control.connected, "devices": devices,
+        "pin_required": bool(br.cfg.ui_pin), "icon_upload_error": br.icon_upload_error, "resume_mode": br.cfg.resume_mode, "error": br.last_error, "speeds": list(SPEEDS),
+        "problems": br.alerts.problems, "alerts": br.alerts.enabled})
+
+
+async def health(request):
+    """Answered through the public address, so the alert check knows the players can reach this bridge."""
+    return web.Response(text=request.app[BRIDGE].alerts.token, headers={"Cache-Control": "no-store"})
+
+
+async def api_alert_test(request):
+    require_pin(request)
+    br: Bridge = request.app[BRIDGE]
+    if not br.alerts.enabled:
+        raise web.HTTPBadRequest(text="Set ntfy_url in config.yaml and restart the bridge first.")
+    ok = await br.alerts.send("Yoto bridge test", "Alerts from the Yoto bridge reach this phone.",
+                              priority="default", tags="bell")
+    if not ok:
+        raise web.HTTPBadGateway(text="ntfy did not accept the alert; see the bridge log.")
+    await br.alerts.check_all()
+    return web.json_response({"ok": True, "problems": br.alerts.problems})
+
+
+async def api_yoto_login(request):
+    require_pin(request)
+    br: Bridge = request.app[BRIDGE]
+    try:
+        async def done():
+            br.icon_upload_error = ""   # a new login may carry the icon scope
+            await br.connect_yoto()
+        return web.json_response(await br.auth.start_login(on_done=done))
+    except YotoNotLoggedIn as e:
+        raise web.HTTPBadRequest(text=str(e))
+
+
+async def api_yoto_finish(request):
+    """Fallback for when the redirect page does not load (e.g. a 127.0.0.1 callback opened on a phone):
+    the user pastes the address it landed on, which carries the code and state."""
+    require_pin(request)
+    br: Bridge = request.app[BRIDGE]
+    url = (await request.json()).get("url", "")
+    q = parse_qs(urlsplit(url.strip()).query)
+    if q.get("error"):
+        raise web.HTTPBadRequest(text=f"Yoto refused the login: {q.get('error_description', q['error'])[0]}")
+    if not q.get("code"):
+        raise web.HTTPBadRequest(text="That address has no login code in it. Copy the whole address of the page Yoto sent you to.")
+    try:
+        await br.auth.finish_login(q["code"][0], (q.get("state") or [""])[0])
+    except YotoLoginError as e:
+        raise web.HTTPBadRequest(text=str(e))
+    return web.json_response({"ok": True})
+
+
+CALLBACK_PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Yoto bridge</title><body style="font-family:system-ui,sans-serif;max-width:28em;margin:3em auto;padding:0 16px">
+<h2>{title}</h2><p>{text}</p></body>"""
+
+
+async def yoto_callback(request):
+    """Yoto sends the browser here after sign-in. Reachable from the internet wherever /s/ is published, so
+    it only completes a login this bridge started (state check) and shows nothing else."""
+    br: Bridge = request.app[BRIDGE]
+    q = request.query
+    if q.get("error"):
+        title, text, status = "Yoto login failed", f"Yoto said: {q.get('error_description') or q['error']}", 400
+    else:
+        try:
+            await br.auth.finish_login(q.get("code", ""), q.get("state", ""))
+            title, text, status = "Yoto connected", "You can close this tab and go back to the bridge page.", 200
+        except YotoLoginError as e:
+            title, text, status = "Yoto login failed", str(e), 400
+    return web.Response(text=CALLBACK_PAGE.format(title=html.escape(title), text=html.escape(text)),
+                        content_type="text/html", status=status)
+
+
+def _book(item: dict, progress: dict | None = None) -> dict:
+    md = item.get("media", {}).get("metadata", {})
+    out = {"id": item["id"], "title": md.get("title") or item.get("title") or "",
+           "author": md.get("authorName") or ", ".join(a.get("name", "") for a in md.get("authors", []) or []),
+           "duration": item.get("media", {}).get("duration")}
+    if progress:
+        out["position"] = progress.get("currentTime")
+        out["finished"] = progress.get("isFinished")
+    return out
+
+
+async def api_book(request):
+    """One book, with the series it belongs to (for "make a series card")."""
+    br: Bridge = request.app[BRIDGE]
+    item = await br.abs.item(request.match_info["item"])
+    out = _book(item)
+    out["series"] = []
+    for sr in _series_entries(item.get("media", {}).get("metadata", {}).get("series")):
+        name, books = await group_books(br.abs, "series", item.get("libraryId", ""), sr["id"])
+        out["series"].append({"id": sr["id"], "name": name or sr.get("name", ""), "sequence": sr.get("sequence"),
+                              "library_id": item.get("libraryId", ""), "books": len(books)})
+    try:
+        out["collections"] = await br.collection_index.for_item(item["id"])
+    except ABSError as e:
+        log.warning("could not list ABS collections: %s", e)
+        out["collections"] = []
+    return web.json_response(out)
+
+
+async def _point_card(br: Bridge, slot, body: dict):
+    """Set what a card plays: a book ({"item_id"}), a whole series ({"series_id", "library_id"}) or a
+    whole collection ({"collection_id"})."""
+    if body.get("series_id") or body.get("collection_id"):
+        slot.group_kind = "collection" if body.get("collection_id") else "series"
+        slot.series_id = body.get("collection_id") or body["series_id"]
+        slot.series_library = body.get("library_id", "")
+        slot.series_name = body.get("series_name") or body.get("collection_name", "")
+        await br.pm.resolve_series(slot, br.cfg.abs_key_for(slot.device_id))
+    else:
+        item = await br.abs.item(body["item_id"])
+        slot.series_id = slot.series_name = slot.series_library = slot.group_kind = ""
+        slot.item_id, slot.title = body["item_id"], _book(item)["title"]
+    br.store.save()
+
+
+async def api_libraries(request):
+    br: Bridge = request.app[BRIDGE]
+    libs = await br.abs.libraries()
+    if br.cfg.library_ids:
+        libs = [l for l in libs if l["id"] in br.cfg.library_ids]
+    return web.json_response([{"id": l["id"], "name": l["name"]} for l in libs])
+
+
+async def api_books(request):
+    br: Bridge = request.app[BRIDGE]
+    lib = request.query["library"]
+    if br.cfg.library_ids and lib not in br.cfg.library_ids:
+        raise web.HTTPForbidden()
+    q = request.query.get("q", "").strip()
+    if q:
+        items = await br.abs.search(lib, q)
+        return web.json_response({"items": [_book(i) for i in items], "total": len(items)})
+    data = await br.abs.library_items(lib, page=int(request.query.get("page", 0)))
+    return web.json_response({"items": [_book(i) for i in data.get("results", [])], "total": data.get("total", 0)})
+
+
+async def api_continue(request):
+    br: Bridge = request.app[BRIDGE]
+    items = await br.abs.items_in_progress()
+    out = []
+    for i in items[:12]:
+        prog = await br.abs.progress(i["id"])
+        if prog and not prog.get("isFinished"):
+            out.append(_book(i, prog))
+    return web.json_response(out)
+
+
+async def api_cover(request):
+    br: Bridge = request.app[BRIDGE]
+    try:
+        data = await br.abs.cover(request.match_info["item"])
+    except ABSError:
+        raise web.HTTPNotFound()
+    return web.Response(body=data, content_type="image/jpeg", headers={"Cache-Control": "max-age=86400"})
+
+
+async def api_play(request):
+    """Play any ABS book on a player, no card needed: point that player's remote slot at the book
+    and tell the player (MQTT) to start its remote playlist. The stream starts at the ABS position."""
+    br: Bridge = request.app[BRIDGE]
+    body = await request.json()
+    device_id, item_id = body["device_id"], body["item_id"]
+    if not br.control.connected:
+        raise web.HTTPServiceUnavailable(text="Not connected to Yoto (MQTT). Connect Yoto first.")
+    slot = await br.ensure_remote_slot(device_id, br.device_name(device_id))
+    # Stop whatever this player is streaming from the bridge, so its position is saved first.
+    for pb in list(br.pm.by_slot.values()):
+        if pb.device_id == device_id:
+            await br.pm.finish_slot(pb.slot, "switched from phone")
+    item = await br.abs.item(item_id)
+    slot.item_id, slot.title = item_id, _book(item)["title"]
+    br.store.save()
+    if br.chapter_mode(slot):
+        await br.save_playlist(slot, cover=False)    # the remote playlist's tracks follow the book's chapters
+    seconds_in = None
+    if br.cfg.resume_mode == "seconds_in":
+        prog = await br.abs.progress(item_id, br.cfg.abs_key_for(device_id)) or {}
+        seconds_in = max(0, int(prog.get("currentTime") or 0) - br.cfg.rewind_seconds)
+    track = 1
+    if br.chapter_mode(slot):
+        prog = await br.abs.progress(item_id, br.cfg.abs_key_for(device_id)) or {}
+        duration, _ = await br.book_info(item_id)
+        at = br.pm._resume_point(float(prog.get("currentTime") or 0), duration)
+        track = chapter_tracks.track_for(slot, item_id, at) or 1
+    br.pm.expect(device_id, slot.yoto_card_id)
+    await br.control.play(device_id, slot.yoto_card_id, seconds_in, track=track)
+    return web.json_response({"ok": True, "title": slot.title})
+
+
+SEEK_ACTIONS = ("back30", "fwd30", "prev", "next")
+
+
+async def api_seek(request):
+    """Skip on a playing Yoto from the phone: back/forward 30 s, previous/next chapter. The Yoto cannot
+    seek inside a stream, so the bridge moves the ABS position and restarts the card there."""
+    br: Bridge = request.app[BRIDGE]
+    body = await request.json()
+    action, device_id = body.get("action"), body.get("device_id")
+    if action not in SEEK_ACTIONS:
+        raise web.HTTPBadRequest(text="action must be one of " + ", ".join(SEEK_ACTIONS))
+    if not br.control.connected:
+        raise web.HTTPServiceUnavailable(text="Not connected to Yoto (MQTT). Connect Yoto first.")
+    pb = br.pm.current_on(device_id)
+    if not pb:
+        raise web.HTTPConflict(text=f"Nothing from the bridge is playing on {br.device_name(device_id)}.")
+    slot = br.store.get(pb.slot)
+    book, at = br.pm.book_position(pb)
+    duration, chapters = await br.book_info(book.item_id)
+    duration = duration or book.duration
+    spans = chapter_tracks.chapter_spans(chapters, duration, br.cfg.part_seconds) if len(chapters) >= 2 else []
+    if action == "back30":
+        target = max(0.0, at - 30)
+    elif action == "fwd30":
+        target = min(max(0.0, duration - 5), at + 30)
+    elif not spans:
+        raise web.HTTPConflict(text="This book has no chapters in Audiobookshelf.")
+    else:
+        i = chapter_tracks.index_at(spans, at)
+        if action == "prev":
+            target = spans[i][0] if at - spans[i][0] > 5 else spans[max(0, i - 1)][0]
+        else:
+            if i + 1 >= len(spans):
+                raise web.HTTPConflict(text="Already in the last chapter.")
+            target = spans[i + 1][0]
+    track = await _restart_at(br, device_id, pb, book.item_id, target, duration, "seek from the phone")
+    log.info("seek %s on %s: %.0fs -> %.0fs (track %s)", action, br.device_name(device_id), at, target, track)
+    return web.json_response({"ok": True, "position": target, "title": book.title})
+
+
+async def _restart_at(br: Bridge, device_id: str, pb, item_id: str, target: float, duration: float, why: str) -> int:
+    """Close the playing session, put ABS at `target` and start the card again there (exactly, no
+    rewind). Used by the phone's seek buttons and by speed changes, which need the audio re-encoded."""
+    slot = br.store.get(pb.slot)
+    br.seeking.add(slot.slot)                     # its own relayout below; skip the after-listen one
+    try:
+        await br.pm.finish_slot(pb.slot, why)
+        await br.abs.patch_progress(item_id, target, duration, pb.abs_key)
+        br.pm.exact_next.add(slot.slot)
+        if br.chapter_mode(slot) and slot.yoto_card_id and not chapter_tracks.same_layout(slot, await br.build_layout(slot)):
+            await br.save_playlist(slot, cover=False)    # only when the book changed: keep the track numbers
+    finally:
+        br.seeking.discard(slot.slot)
+    track = (chapter_tracks.track_for(slot, item_id, target) if br.chapter_mode(slot) else None) or 1
+    br.pm.expect(device_id, slot.yoto_card_id)
+    await br.control.play(device_id, slot.yoto_card_id, None, track=track)
+    return track
+
+
+SPEEDS = (0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0)
+
+
+def _parse_speed(value, allow_none: bool) -> float:
+    """A speed from the page: 0.5 to 2.5 (atempo's range is wider; past 2.5 speech is hard to follow).
+    allow_none: 0 or null means "no own speed" (a card that follows its player)."""
+    try:
+        v = float(value or 0)
+    except (TypeError, ValueError):
+        raise web.HTTPBadRequest(text="speed must be a number")
+    if allow_none and v == 0:
+        return 0.0
+    if not 0.5 <= v <= 2.5:
+        raise web.HTTPBadRequest(text="speed must be between 0.5 and 2.5")
+    return round(v, 2)
+
+
+async def _apply_speed(br: Bridge, pbs: list) -> None:
+    """A speed changed: restart whatever is playing at the wrong speed right where it is, so the
+    new speed is heard at once; and redo warm starts, which are encoded at a speed."""
+    for pb in pbs:
+        slot = br.store.get(pb.slot)
+        if not slot or not pb.device_id or br.pm.speed_for(slot, pb.device_id) == pb.speed:
+            continue
+        book, at = br.pm.book_position(pb)
+        if br.control.connected:
+            await _restart_at(br, pb.device_id, pb, book.item_id, at, book.duration, "speed changed")
+            log.info("%s on %s: speed now %gx, restarted at %.0fs", book.title, br.device_name(pb.device_id),
+                     br.pm.speed_for(slot, pb.device_id), at)
+    br.pm._bg(br.pm.prepare_all())
+
+
+async def api_player_speed(request):
+    """Playback speed of a player: every card it plays, unless the card has its own speed."""
+    br: Bridge = request.app[BRIDGE]
+    body = await request.json()
+    device_id, speed = body.get("device_id"), _parse_speed(body.get("speed"), allow_none=False)
+    if not device_id:
+        raise web.HTTPBadRequest(text="device_id required")
+    if speed == 1.0:
+        br.store.state.speeds.pop(device_id, None)
+    else:
+        br.store.state.speeds[device_id] = speed
+    br.store.save()
+    await _apply_speed(br, [pb for pb in br.pm.by_slot.values() if pb.device_id == device_id])
+    return web.json_response({"ok": True, "speed": speed})
+
+
+async def api_card_speed(request):
+    """A card's own playback speed, on whichever player; 0 = the player's speed."""
+    require_pin(request)
+    br: Bridge = request.app[BRIDGE]
+    slot = br.store.get(request.match_info["slot"])
+    if not slot or slot.kind != "card":
+        raise web.HTTPNotFound()
+    body = await request.json()
+    slot.speed = _parse_speed(body.get("speed"), allow_none=True)
+    br.store.save()
+    pb = br.pm.by_slot.get(slot.slot)
+    await _apply_speed(br, [pb] if pb else [])
+    return web.json_response({"ok": True, "speed": slot.speed})
+
+
+async def api_control(request):
+    br: Bridge = request.app[BRIDGE]
+    body = await request.json()
+    action, device_id = body["action"], body["device_id"]
+    if action not in ("pause", "resume", "stop"):
+        raise web.HTTPBadRequest()
+    await getattr(br.control, action)(device_id)
+    return web.json_response({"ok": True})
+
+
+async def api_cards(request):
+    br: Bridge = request.app[BRIDGE]
+    return web.json_response([{"slot": s.slot, "item_id": s.item_id, "title": s.title,
+                               "yoto_card_id": s.yoto_card_id, "yoto_title": s.yoto_title,
+                               "stream_url": br.stream_url(s.slot), "offline": _offline_info(s),
+                               "series_id": s.series_id, "series_name": s.series_name, "speed": s.speed,
+                               "group_kind": (s.group_kind or "series") if s.series_id else ""}
+                              for s in br.store.cards()])
+
+
+def _offline_info(s) -> dict | None:
+    o = s.offline
+    if not o:
+        return None
+    keep = ("status", "step", "error", "hours", "speed", "start", "end", "last_pos", "last_event_at",
+            "from_title", "to_title", "last_book")
+    return {**{k: o[k] for k in keep if k in o}, "tracks": len(o.get("tracks", []))}
+
+
+async def api_card_offline(request):
+    """Make offline: upload the next hours of the card's book to the card as ordinary Yoto tracks."""
+    require_pin(request)
+    br: Bridge = request.app[BRIDGE]
+    slot = br.store.get(request.match_info["slot"])
+    if not slot or slot.kind != "card":
+        raise web.HTTPNotFound()
+    body = await request.json() if request.can_read_body else {}
+    try:
+        info = br.offline.start(slot, body.get("hours"), body.get("speed"))
+    except ValueError as e:
+        raise web.HTTPConflict(text=str(e))
+    return web.json_response(info)
+
+
+async def api_card_online(request):
+    """Back to streaming: put the stream track back; the next tap resumes from ABS."""
+    require_pin(request)
+    br: Bridge = request.app[BRIDGE]
+    slot = br.store.get(request.match_info["slot"])
+    if not slot or slot.kind != "card":
+        raise web.HTTPNotFound()
+    await br.offline.go_online(slot)
+    return web.json_response({"ok": True})
+
+
+async def api_card_create(request):
+    """New card: create a Yoto playlist that streams a new slot. Then link it to a blank MYO card
+    in the Yoto app (linking a physical card is app-only)."""
+    require_pin(request)
+    br: Bridge = request.app[BRIDGE]
+    body = await request.json()
+    slot = br.store.new_slot("card")
+    try:
+        await _point_card(br, slot, body)
+    except Exception:
+        br.store.delete(slot.slot)
+        raise
+    await br.save_playlist(slot)
+    return web.json_response({"slot": slot.slot, "yoto_card_id": slot.yoto_card_id})
+
+
+async def api_card_convert(request):
+    """Repurpose an existing MYO playlist (already linked to a physical card): replace its audio with
+    a bridge stream. The physical card keeps working with no re-linking. Destroys that playlist's
+    current audio, so the page asks first."""
+    require_pin(request)
+    br: Bridge = request.app[BRIDGE]
+    body = await request.json()
+    if not body.get("confirm"):
+        raise web.HTTPBadRequest(text="confirm required: this replaces the playlist's audio")
+    yoto_card_id = body["yoto_card_id"]
+    if br.store.by_yoto_card(yoto_card_id):
+        raise web.HTTPConflict(text="That playlist is already a bridge card.")
+    slot = br.store.new_slot("card", yoto_card_id=yoto_card_id)
+    try:
+        await _point_card(br, slot, body)
+    except Exception:
+        br.store.delete(slot.slot)
+        raise
+    await br.save_playlist(slot)
+    return web.json_response({"slot": slot.slot})
+
+
+async def api_card_assign(request):
+    """Point an existing bridge card at a different book. Local change; the Yoto playlist's title
+    and cover are updated too so the Yoto app shows the right book (best effort)."""
+    require_pin(request)
+    br: Bridge = request.app[BRIDGE]
+    slot = br.store.get(request.match_info["slot"])
+    if not slot or slot.kind != "card":
+        raise web.HTTPNotFound()
+    body = await request.json()
+    await br.pm.finish_slot(slot.slot, "card reassigned")
+    if slot.offline:
+        await br.offline.go_online(slot)   # the offline copy is of the old book
+    await _point_card(br, slot, body)
+    try:
+        await br.save_playlist(slot)
+    except Exception as e:
+        log.warning("Yoto title update failed (card still plays the new book): %s", e)
+    return web.json_response({"ok": True})
+
+
+async def api_card_delete(request):
+    require_pin(request)
+    br: Bridge = request.app[BRIDGE]
+    await br.pm.finish_slot(request.match_info["slot"], "card removed")
+    task = br.offline.tasks.pop(request.match_info["slot"], None)
+    if task:
+        task.cancel()
+    br.store.delete(request.match_info["slot"])
+    return web.json_response({"ok": True})
+
+
+async def api_yoto_playlists(request):
+    require_pin(request)
+    br: Bridge = request.app[BRIDGE]
+    mine = await br.yoto.my_playlists()
+    return web.json_response([{"cardId": c.get("cardId"), "title": c.get("title"),
+                               "bridge": bool(br.store.by_yoto_card(c.get("cardId", "")))} for c in mine
+                              if not c.get("deleted")])
+
+
+async def index(request):
+    if not (STATIC / "index.html").exists():
+        return web.Response(status=503, text="The phone page has not been built. In web/, run: npm ci && npm run build")
+    return web.FileResponse(STATIC / "index.html")
+
+
+@web.middleware
+async def errors(request, handler):
+    try:
+        return await handler(request)
+    except web.HTTPException:
+        raise
+    except YotoNotLoggedIn as e:
+        return web.json_response({"error": str(e)}, status=409)
+    except ABSError as e:
+        return web.json_response({"error": str(e)}, status=502)
+    except Exception as e:
+        log.exception("request failed: %s", request.path)
+        return web.json_response({"error": str(e)}, status=500)
+
+
+def make_app(br: Bridge) -> web.Application:
+    app = web.Application(middlewares=[errors])
+    app[BRIDGE] = br
+    r = app.router
+    r.add_get(CALLBACK_PATH, yoto_callback)
+    r.add_get("/s/icon/{slot}.png", stream_icon)
+    r.add_get("/s/icon/{slot}/{layout}/{k}.png", stream_track_icon)
+    r.add_route("GET", "/s/{slot}/{layout}/{k}.mp3", stream_track)
+    r.add_route("HEAD", "/s/{slot}/{layout}/{k}.mp3", stream_track)
+    r.add_get("/s/health", health)
+    r.add_route("GET", "/s/{slot}.mp3", stream)
+    r.add_route("HEAD", "/s/{slot}.mp3", stream)
+    r.add_get("/", index)
+    if STATIC.is_dir():                 # built from web/ (see Dockerfile); absent in a bare checkout
+        r.add_static("/static", STATIC)
+    r.add_get("/api/status", api_status)
+    r.add_post("/api/yoto/login", api_yoto_login)
+    r.add_post("/api/yoto/finish", api_yoto_finish)
+    r.add_get("/api/yoto/playlists", api_yoto_playlists)
+    r.add_get("/api/book/{item}", api_book)
+    r.add_get("/api/libraries", api_libraries)
+    r.add_get("/api/books", api_books)
+    r.add_get("/api/continue", api_continue)
+    r.add_get("/api/cover/{item}", api_cover)
+    r.add_post("/api/play", api_play)
+    r.add_post("/api/control", api_control)
+    r.add_post("/api/seek", api_seek)
+    r.add_post("/api/speed", api_player_speed)
+    r.add_post("/api/alerts/test", api_alert_test)
+    r.add_get("/api/cards", api_cards)
+    r.add_post("/api/cards", api_card_create)
+    r.add_post("/api/cards/convert", api_card_convert)
+    r.add_put("/api/cards/{slot}", api_card_assign)
+    r.add_post("/api/cards/{slot}/offline", api_card_offline)
+    r.add_post("/api/cards/{slot}/online", api_card_online)
+    r.add_put("/api/cards/{slot}/speed", api_card_speed)
+    r.add_delete("/api/cards/{slot}", api_card_delete)
+    chapter_api.register(app, br, require_pin)
+    transfer.register(app, br, require_pin, _point_card)
+    return app

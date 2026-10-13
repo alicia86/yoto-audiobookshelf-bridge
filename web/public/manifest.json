@@ -1,0 +1,3 @@
+{"name": "Yoto Bridge", "short_name": "Yoto Bridge", "start_url": "/", "display": "standalone",
+ "background_color": "#ffffff", "theme_color": "#ffffff",
+ "icons": [{"src": "/static/icon.svg", "sizes": "any", "type": "image/svg+xml"}]}

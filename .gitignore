@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+data/
+web/node_modules/
+# built from web/ (npm run build, or the Dockerfile's first stage)
+yotobridge/static/
+
+# local Python environments (e.g. for tools/audio_chapters.py)
+.venv*/
