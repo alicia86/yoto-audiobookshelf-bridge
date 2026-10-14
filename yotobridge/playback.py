@@ -7,8 +7,11 @@ app may have moved), and every position the Yoto reaches goes back to ABS.
 Where the listener is comes from two independent sources:
   1. MQTT events from the player (`position`), when available. Preferred.
   2. What the bridge itself sent. The listener cannot be past the audio delivered, nor further than
-     the wall-clock time since the stream started. Without MQTT, the estimate is that bound minus
-     the player's buffer, which errs toward repeating a few seconds rather than skipping any.
+     the time the player has spent playing since the stream started (wall clock less the time the
+     player reported itself paused or stopped). The Yoto does not report positions while streaming,
+     so this is usually the estimate: that bound less a few seconds for the player to start, or,
+     without MQTT (no pause events), less the player's whole buffer. Both err toward repeating a
+     few seconds rather than skipping any.
 The MQTT position is always clamped by (2), which also absorbs the unknown of whether the player's
 counter restarts when it reconnects.
 
@@ -32,6 +35,8 @@ from .streamer import Track
 
 log = logging.getLogger(__name__)
 now = time.monotonic
+
+STARTUP_LAG_SECONDS = 3.0            # from the request for audio to the player playing it (see position())
 
 
 @dataclass
@@ -90,6 +95,8 @@ class Playback:
     track: int = 0
     started_wall: float = field(default_factory=time.time)
     speed: float = 1.0               # playback speed this stream is encoded at
+    paused_at: float | None = None   # since when the player reports this stream paused or stopped
+    paused_total: float = 0.0        # seconds it spent paused since the stream started
 
 
 class PlaybackManager:
@@ -197,6 +204,7 @@ class PlaybackManager:
                 pb.main_started = now()
                 pb.main_bytes = 0
                 pb.event_offset = None
+                pb.paused_at, pb.paused_total = None, 0.0
             return pb, start
 
     async def open_track(self, slot: Slot, range_start: int, client_ip: str | None, req: dict) -> tuple[Playback, float]:
@@ -227,6 +235,7 @@ class PlaybackManager:
                 pb.main_started = now()
                 pb.main_bytes = 0
                 pb.event_offset = None
+                pb.paused_at, pb.paused_total = None, 0.0
             return pb, start
 
     async def _begin_track(self, slot: Slot, client_ip: str | None, req: dict) -> Playback:
@@ -323,7 +332,8 @@ class PlaybackManager:
         prog = await self.abs.progress(slot.item_id, key) or {}
         tracks = self._tracks(await self.abs.item_tracks(slot.item_id, key))
         duration = (tracks[-1].start + tracks[-1].duration) if tracks else 0.0
-        start = self._resume_point(float(prog.get("currentTime") or 0), duration)
+        pos = float(prog.get("currentTime") or 0)
+        start = pos if slot.slot in self.exact_next else self._resume_point(pos, duration)
         speed = self.speed_for(slot, slot.device_id)
         w = self.warm.get(slot.slot)
         if w and w.item_id == slot.item_id and w.key == key and w.speed == speed and abs(w.start - start) < 0.5:
@@ -470,6 +480,12 @@ class PlaybackManager:
             pb.playing_logged = True
             log.info("%s playing on %s, %.1fs after the player asked for the audio", pb.title or pb.item_id,
                      device_id, now() - pb.main_started)
+        status = ev.get("playbackStatus")
+        if status in ("paused", "stopped") and pb.paused_at is None:
+            pb.paused_at = now()
+        elif status == "playing" and pb.paused_at is not None:
+            pb.paused_total += now() - max(pb.paused_at, pb.main_started)
+            pb.paused_at = None
         pb.event = dict(merged)
         pb.event_at = now()
         if "position" in ev and pb.event_offset is None and self.cfg.position_mode == "relative":
@@ -567,7 +583,10 @@ class PlaybackManager:
         # The Yoto downloads well ahead (seen: ~12 min of audio in 9 s) and closes the connection, then
         # plays from its buffer; so wall-clock time keeps counting after the stream closes, capped by
         # what was delivered.
-        cap = pb.base + min(pb.main_bytes / self.rate(pb), max(0.0, now() - pb.main_started) * pb.speed)
+        played = now() - pb.main_started - pb.paused_total
+        if pb.paused_at is not None:
+            played -= now() - max(pb.paused_at, pb.main_started)
+        cap = pb.base + min(pb.main_bytes / self.rate(pb), max(0.0, played) * pb.speed)
         cap = min(cap, pb.duration) if pb.duration else cap
         ev = pb.event
         status = ev.get("playbackStatus")
@@ -583,7 +602,15 @@ class PlaybackManager:
             # absolute positions (seconds_in mode): the player seeks itself, so the delivery bound
             # does not apply; only the book length does.
             return max(min(p, pb.duration or p), 0.0)
-        return max(pb.base, cap - self.cfg.player_buffer_seconds * pb.speed, min(pb.last_pos, cap))
+        # When the player sends status events, the clock above stops while it is paused or stopped, so
+        # only the start-up delay is unknown (seen: under 3 s from the request for audio to playing).
+        # Subtracting the whole buffer there would lose up to that much listening on every seek or
+        # speed change (at 2x, the first 40 s of book).
+        lag = self.cfg.player_buffer_seconds
+        reports = (self.devices.get(pb.device_id) or {}).get("playbackStatus") if pb.device_id else None
+        if reports and self.control is not None and getattr(self.control, "connected", False):
+            lag = min(lag, STARTUP_LAG_SECONDS)
+        return max(pb.base, cap - lag * pb.speed, min(pb.last_pos, cap))
 
     # ---------------- ABS writes ----------------
 

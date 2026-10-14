@@ -61,7 +61,7 @@ class Config:
     card_uri_format: str = "https://yoto.io/{card_id}"
 
     rewind_seconds: int = 5           # back up a little on every resume, like most audiobook apps
-    player_buffer_seconds: int = 20   # used only when no MQTT position is available
+    player_buffer_seconds: int = 20   # used only without MQTT (no position or pause events)
     sync_interval: int = 15           # seconds between progress writes to ABS
     # Faster card start: keep the first seconds of every card's audio, from where ABS has it, encoded
     # in advance, so a tap sends audio at once instead of waiting for ffmpeg. 0 = off.

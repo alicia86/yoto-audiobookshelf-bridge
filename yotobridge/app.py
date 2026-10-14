@@ -325,9 +325,11 @@ async def stream(request: web.Request) -> web.StreamResponse:
     return await _respond(request, br, slot, lambda start_byte: br.pm.open_stream(slot, start_byte, ip), head_length)
 
 
-async def resolve_track(br: Bridge, slot, layout_id: str, k: int) -> dict | None:
+async def resolve_track(br: Bridge, slot, layout_id: str, k: int, probe: bool = False) -> dict | None:
     """What chapter track k of a layout plays now (rules in chapters.py). Returns the request for
-    open_track, or {"jump": track} when a fresh tap asked for a track other than the listener's."""
+    open_track, or {"jump": track} when a fresh tap asked for a track other than the listener's.
+    probe: a HEAD request, which the player sends before the GET; it must not use up a one-time
+    "no rewind" (exact_next), or the GET right after it would rewind."""
     seg = chapter_tracks.segment(slot, layout_id, k)
     if not seg:
         return None
@@ -355,8 +357,9 @@ async def resolve_track(br: Bridge, slot, layout_id: str, k: int) -> dict | None
     exact = slot.slot in br.pm.exact_next            # just moved there with the phone's seek buttons: no rewind
     start = pos if exact else br.pm._resume_point(pos, duration)
     if item == seg.item_id and seg.start <= start < seg.end - 1:
-        br.pm.exact_next.discard(slot.slot)
-        br.jumping.pop(slot.slot, None)              # the player is where it should be
+        if not probe:
+            br.pm.exact_next.discard(slot.slot)
+            br.jumping.pop(slot.slot, None)          # the player is where it should be
         req["start"] = max(seg.start, start)         # a plain tap on the listener's chapter: resume
         return req
     right = chapter_tracks.track_for(slot, item, start) if layout_id == slot.layout_id else None
@@ -365,7 +368,8 @@ async def resolve_track(br: Bridge, slot, layout_id: str, k: int) -> dict | None
                  slot.title, k, right)
         return {"jump": right}
     # no way to move the player (or it ignored the move): play from the listener's spot under this track
-    br.pm.exact_next.discard(slot.slot)
+    if not probe:
+        br.pm.exact_next.discard(slot.slot)
     spans = chapter_tracks.chapter_spans(chapters, duration, br.cfg.part_seconds)
     end = spans[chapter_tracks.index_at(spans, start)][1] if spans else duration
     req.update(item_id=item, title=slot.title if slot.series_id else seg.book, start=start,
@@ -409,7 +413,7 @@ async def stream_track(request: web.Request) -> web.StreamResponse:
     if layout != request.match_info["layout"]:
         log.info("%s: player asked for an old track list (%s); serving the current one", slot.title,
                  request.match_info["layout"])
-    req = await resolve_track(br, slot, layout, k)
+    req = await resolve_track(br, slot, layout, k, probe=request.method == "HEAD")
     if not req:
         raise web.HTTPNotFound(text="This track list is out of date; take the card out and put it back in.")
     if "jump" in req:

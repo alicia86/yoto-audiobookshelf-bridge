@@ -1426,6 +1426,7 @@ async def test_changing_player_speed_restarts_what_it_plays_in_place(env):
     r = await client.post("/api/speed", json={"device_id": "dev-mini", "speed": 1.5})
     assert r.status == 200 and br.store.state.speeds == {"dev-mini": 1.5}
     assert env.abs.progress["li1"]["currentTime"] == 31.0 and control.tracks[-1] == 2
+    assert (await client.head(f"/s/{slot}/{lid}/2.mp3")).status == 200   # the player probes first
     r, _ = await _get(client, f"/s/{slot}/{lid}/2.mp3")
     assert br.pm.by_slot[slot].speed == 1.5
     assert int(r.headers["Content-Length"]) == int(9 * BYTERATE / 1.5)      # 31 s to 40 s, no rewind, at 1.5x
@@ -1444,3 +1445,27 @@ async def test_player_speed_back_to_normal_and_card_follows_player_again(env):
     assert br.store.get(s.slot).speed == 0.0
     cards = await (await client.get("/api/cards")).json()
     assert cards[0]["speed"] == 0.0
+
+
+async def test_position_counts_only_time_spent_playing(env):
+    """The Yoto sends no positions while streaming, so position is the time it has played: at 2x,
+    10 s of playing (after the start-up allowance) is 20 s of book, and time paused does not count.
+    Switching speed while paused must restart from there, not from where the 2x stream began."""
+    br, client, control = await env.make()
+    br.store.state.speeds["dev-mini"] = 2.0
+    s = card(br)
+    br.pm.on_event("dev-mini", {"cardId": "yc1", "playbackStatus": "playing"})
+    pb, start = await br.pm.open_stream(br.store.get(s.slot), 0, None)
+    assert pb.speed == 2.0 and start == 0.0
+    br.pm.on_bytes(pb, 30 * BYTERATE, True)           # 60 s of book delivered ahead
+    pb.main_started -= 13                             # 13 s since the request: ~10 s heard
+    assert br.pm.position(pb) == pytest.approx(20.0, abs=0.3)
+    br.pm.on_event("dev-mini", {"cardId": "yc1", "playbackStatus": "paused"})
+    pb.paused_at -= 30                                # paused 30 s ago...
+    pb.main_started -= 30                             # ...right after those 13 s
+    assert br.pm.position(pb) == pytest.approx(20.0, abs=0.3)
+    br.pm.on_event("dev-mini", {"cardId": "yc1", "playbackStatus": "playing"})
+    pb.main_started -= 2
+    assert br.pm.position(pb) == pytest.approx(24.0, abs=0.3)
+    control.connected = False                         # no pause events: the whole buffer is uncertain
+    assert br.pm.position(pb) == pytest.approx(max(0.0, 24.0 + 2 * 3 - 2 * 20), abs=0.3)
