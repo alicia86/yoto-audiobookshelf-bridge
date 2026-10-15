@@ -23,6 +23,27 @@ export type Status = {
   error: string
   problems?: string[]
   icon_upload_error?: string
+  icons?: IconSettings
+}
+
+// Pixel icons on the Yoto's display: the default style, and the styles a card can have
+export type IconSettings = {
+  styles: { id: string; label: string }[]
+  style: string // the default style
+  allow_all: boolean // theme icons may be anything, not only kid-safe ones
+  enabled: boolean // chapter_icons in config.yaml
+  ai?: { enabled: boolean; mode: "library" | "images" } // AI chapter pictures (ai_pictures in config.yaml)
+}
+
+// A background job making AI pictures for a card's chapters
+export type AIJob = {
+  status: "running" | "done" | "failed" | "cancelled"
+  done: number
+  total: number
+  skipped: number
+  step: string
+  error: string
+  mode: "library" | "images"
 }
 
 export type Book = {
@@ -45,6 +66,9 @@ export type Offline = {
   status: "building" | "ready" | "failed"
   step?: string
   error?: string
+  mode?: "next" | "book" | "series"
+  books_left_off?: number
+  on_card?: number // while building: tracks already on the card (the rest stream)
   hours?: number
   speed?: number
   start?: number
@@ -68,6 +92,10 @@ export type CardSlot = {
   series_name: string
   group_kind: "" | "series" | "collection"
   speed: number // 0 = the player's speed
+  icon_style: string // "" = the default style
+  icon_custom: boolean // a picture of the owner's own is uploaded
+  icon_chapters: number // chapters with a picture of their own
+  ai_job?: AIJob | null
 }
 
 export type Library = { id: string; name: string }

@@ -22,14 +22,16 @@ export function onPinRequest(fn: () => Promise<string | null>) {
   askPin = fn
 }
 
+// body: JSON-encoded, unless it is a Blob (a file, sent as it is)
 export async function api<T = unknown>(path: string, opts: { method?: string; body?: unknown } = {}): Promise<T> {
-  const headers: Record<string, string> = { "Content-Type": "application/json" }
+  const raw = opts.body instanceof Blob
+  const headers: Record<string, string> = { "Content-Type": raw ? (opts.body as Blob).type || "application/octet-stream" : "application/json" }
   const pin = getPin()
   if (pin) headers["X-Pin"] = pin
   const r = await fetch(path, {
     method: opts.method ?? "GET",
     headers,
-    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+    body: raw ? (opts.body as Blob) : opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
   })
   if (r.status === 401) {
     const p = await askPin()

@@ -5,6 +5,7 @@ Every call takes the API key to use, so different Yoto players can map to differ
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 from urllib.parse import urlsplit
@@ -30,13 +31,17 @@ class ABSClient:
         return {"Authorization": f"Bearer {key or self.default_key}"}
 
     async def _req(self, method: str, path: str, key: str | None = None, timeout: float = 30, **kw):
-        async with self.http.request(method, self.base + path, headers=self._headers(key),
-                                     timeout=aiohttp.ClientTimeout(total=timeout), **kw) as r:
-            if r.status >= 400:
-                raise ABSError(r.status, (await r.text())[:200])
-            if r.content_type == "application/json":
-                return await r.json()
-            return await r.read()
+        try:
+            async with self.http.request(method, self.base + path, headers=self._headers(key),
+                                         timeout=aiohttp.ClientTimeout(total=timeout), **kw) as r:
+                if r.status >= 400:
+                    raise ABSError(r.status, (await r.text())[:200])
+                if r.content_type == "application/json":
+                    return await r.json()
+                return await r.read()
+        except asyncio.TimeoutError:
+            # A bare TimeoutError has no message, so the phone page showed an empty error.
+            raise ABSError(504, f"Audiobookshelf did not answer within {timeout:g} s, try again") from None
 
     def full_url(self, content_url: str) -> str:
         """ABS returns track URLs relative to the server. If ABS runs under a sub-path and the
@@ -62,7 +67,8 @@ class ABSClient:
             "limit": limit, "page": page, "sort": "addedAt", "desc": 1, "minified": 1})
 
     async def search(self, library_id: str, q: str, key=None) -> list[dict]:
-        data = await self._req("GET", f"/api/libraries/{library_id}/search", key, params={"q": q, "limit": 30})
+        data = await self._req("GET", f"/api/libraries/{library_id}/search", key, timeout=90,
+                               params={"q": q, "limit": 30})
         return [b["libraryItem"] for b in data.get("book", [])]
 
     async def item(self, item_id: str, key=None) -> dict:

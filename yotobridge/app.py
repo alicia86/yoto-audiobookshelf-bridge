@@ -3,7 +3,9 @@ and the wiring between ABS, Yoto and the playback manager."""
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
+import shutil
 import logging
 import time
 from pathlib import Path
@@ -18,6 +20,8 @@ from . import chapter_api
 from . import transfer
 from . import chapters as chapter_tracks
 from . import icons
+from .icon_themes import IconLibrary
+from .ai_pictures import AIPictures, AISettings
 from .offline import OfflineManager
 from .series import CollectionIndex, _series_entries, group_books
 from .config import Config
@@ -44,6 +48,8 @@ class Bridge:
                              Path(cfg.data_dir) / "yoto_tokens.json",
                              redirect_uri=cfg.yoto_redirect_uri or f"{cfg.public_url}{CALLBACK_PATH}")
         self.yoto = YotoAPI(http, self.auth, cfg.yoto_api)
+        self.icon_library = IconLibrary(self.yoto, cfg.data_dir)
+        self.ai = AIPictures(self, AISettings.parse(cfg.ai_pictures))
         self.pm = PlaybackManager(cfg, self.abs, self.store)
         factory = control_factory or (lambda: YotoControl(self.auth, cfg.card_uri_format, self.on_yoto_event))
         self.control = factory()
@@ -74,8 +80,74 @@ class Bridge:
         """What slot.stream_url should be: the single stream, or (chapter tracks) the slot's track prefix."""
         return f"{self.cfg.public_url}/s/{slot.slot}/" if self.chapter_mode(slot) else self.stream_url(slot.slot)
 
-    def icon_url(self, slot: str) -> str:
-        return f"{self.cfg.public_url}/s/icon/{slot}.png" if self.cfg.chapter_icons else ""
+    # ---------------- icon styles ----------------
+
+    def icon_style(self, slot) -> str:
+        """The card's own icon style, else the default. A card set to its own picture without one
+        uploaded uses the default."""
+        own = slot.icon_style if slot and slot.kind == "card" else ""
+        if own == "custom":
+            if slot.icon_custom or slot.icon_chapters:
+                return own
+            own = ""
+        style = own or self.store.state.icon_style
+        return style if style in icons.STYLES and style != "custom" else icons.DEFAULT_STYLE
+
+    def icon_tag(self, slot) -> str:
+        """Part of the icon URLs that changes with the look, so the Yoto fetches new icons instead of
+        showing cached ones. Empty for the default style, which keeps the URLs cards were made with."""
+        style = self.icon_style(slot)
+        if style == icons.DEFAULT_STYLE:
+            return ""
+        extra = (str(self.store.state.icon_allow_all) if style == "theme"
+                 else f"{slot.icon_custom}|{sorted(slot.icon_chapters.items())}|{self.fallback_style()}"
+                 if style == "custom" else "")
+        return hashlib.sha1(f"{style}|{extra}".encode()).hexdigest()[:8]
+
+    def _icon_base(self, slot) -> str | None:
+        if not self.cfg.chapter_icons or self.icon_style(slot) == "none":
+            return None
+        tag = self.icon_tag(slot)
+        return f"{self.cfg.public_url}/s/icon/{tag}" if tag else f"{self.cfg.public_url}/s/icon"
+
+    def icon_url(self, slot_id: str) -> str:
+        base = self._icon_base(self.store.get(slot_id))
+        return f"{base}/{slot_id}.png" if base else ""
+
+    def track_icon_url(self, slot, layout_id: str, k: int) -> str | None:
+        base = self._icon_base(slot)
+        return f"{base}/{slot.slot}/{layout_id}/{k}.png" if base else None
+
+    def custom_icon_path(self, slot, chapter_key: str = "") -> Path:
+        """The card's own picture, or (chapter_key "<item>:<n>") the picture of one chapter."""
+        d = Path(self.cfg.data_dir) / "icons"
+        return d / slot.slot / f"{chapter_key.replace(':', '-')}.rgba" if chapter_key else d / f"{slot.slot}.rgba"
+
+    def fallback_style(self) -> str:
+        """What a custom card shows for a chapter with no picture of its own and no card picture."""
+        style = self.store.state.icon_style
+        return style if style in icons.STYLES and style not in ("custom", "none") else icons.DEFAULT_STYLE
+
+    def custom_picture(self, slot, item_id: str, number: int | None) -> tuple[str, Path] | None:
+        """(hash, file) of the picture a custom card shows for a chapter: the chapter's own, else the card's."""
+        key = f"{item_id}:{number}"
+        if number and key in slot.icon_chapters:
+            return slot.icon_chapters[key], self.custom_icon_path(slot, key)
+        if slot.icon_custom:
+            return slot.icon_custom, self.custom_icon_path(slot)
+        return None
+
+    async def apply_icon_style(self, slots=None):
+        """Rewrite the playlists whose icon URLs no longer match their style. A card that is playing
+        (or holds an offline copy) keeps its icons until it stops (relayout) or goes back to streaming."""
+        for slot in list(slots if slots is not None else self.store.state.slots.values()):
+            if (not slot.yoto_card_id or not slot.stream_url or slot.offline or slot.slot in self.pm.by_slot
+                    or slot.icon_url == self.icon_url(slot.slot)):
+                continue
+            try:
+                await self.save_playlist(slot, cover=False)
+            except Exception as e:
+                log.warning("could not change the icons of %s: %s", slot.yoto_title or slot.slot, e)
 
     # ---------------- chapter icons ----------------
 
@@ -117,31 +189,77 @@ class Bridge:
                 or slot.slot in self.pm.by_slot or slot.slot in self.seeking):
             return
         try:
-            if chapter_tracks.same_layout(slot, await self.build_layout(slot)):
+            if (chapter_tracks.same_layout(slot, await self.build_layout(slot))
+                    and slot.icon_url == self.icon_url(slot.slot)):
                 return                               # same book(s): keep the numbering the player remembers
             await self.save_playlist(slot, cover=False)
         except Exception as e:
             log.warning("could not update the chapter tracks of %s: %s", slot.title or slot.slot, e)
 
-    async def icon_png(self, item_id: str, pos: float | None) -> bytes:
+    async def cover16(self, item_id: str) -> bytes | None:
         if item_id not in self._cover16:
             try:
                 self._cover16[item_id] = await icons.shrink_cover(await self.abs.cover(item_id))
             except ABSError:
                 self._cover16[item_id] = None
-        number = icons.chapter_number(await self.chapters(item_id), pos) if pos is not None else None
-        return icons.render(self._cover16[item_id], number)
+        return self._cover16[item_id]
 
-    async def uploaded_icon(self, item_id: str, pos: float) -> str | None:
+    async def theme_icon(self, slot, item_id: str, pos: float | None) -> dict | None:
+        """The Yoto library icon matching the title of the chapter at pos (theme style), or None."""
+        chapters = await self.chapters(item_id)
+        number = icons.chapter_number(chapters, pos) if pos is not None else None
+        if not number or not await self.icon_library.load():
+            return None
+        return self.icon_library.match(chapters[number - 1].get("title") or "", self.store.state.icon_allow_all)
+
+    async def icon_png(self, slot, item_id: str, pos: float | None, style: str | None = None) -> bytes:
+        """The icon of the chapter at pos (None: no chapter number) in the card's style."""
+        style = style or self.icon_style(slot)
+        if style == "custom":
+            number = icons.chapter_number(await self.chapters(item_id), pos) if pos is not None else None
+            pic = self.custom_picture(slot, item_id, number) if slot else None
+            try:
+                if pic:
+                    return icons.png(pic[1].read_bytes())
+            except OSError:
+                pass
+            style = self.fallback_style()
+        if style == "theme":
+            ic = await self.theme_icon(slot, item_id, pos)
+            raw = await self.icon_library.png(ic) if ic else None
+            px = await icons.shrink_cover(raw) if raw else None
+            if px:
+                return icons.png(px)
+            style = icons.DEFAULT_STYLE          # no matching icon (e.g. "Chapter 7"): cover and number
+        chapters = await self.chapters(item_id)
+        number = icons.chapter_number(chapters, pos) if pos is not None else None
+        fraction = None
+        duration = self._durations.get(item_id) or 0
+        if pos is not None and duration:
+            start = float(chapters[number - 1].get("start", 0)) if number else pos
+            fraction = min(1.0, max(0.0, start / duration))
+        return icons.render_style(style, await self.cover16(item_id), number, fraction, seed=f"{item_id}:{number or 0}")
+
+    async def uploaded_icon(self, slot, item_id: str, pos: float) -> str | None:
         """An uploaded Yoto icon for the chapter at pos (for offline copies), reused across copies.
         None when uploads are not allowed (the Yoto app lacks the user:icons:manage scope)."""
-        if not self.cfg.chapter_icons or self.icon_upload_error:
+        style = self.icon_style(slot)
+        if not self.cfg.chapter_icons or style == "none":
+            return None
+        if style == "theme":
+            ic = await self.theme_icon(slot, item_id, pos)
+            if ic:
+                return f"yoto:#{ic['mediaId']}"     # Yoto's own icon: nothing to upload
+        if self.icon_upload_error:
             return None
         number = icons.chapter_number(await self.chapters(item_id), pos)
-        key = f"{icons.STYLE}:{item_id}:{number or 0}"   # a new icon style uploads afresh
+        tag = self.icon_tag(slot)
+        pic = self.custom_picture(slot, item_id, number) if style == "custom" else None
+        key = (f"custom:{pic[0]}" if pic else
+               f"{icons.STYLE}:{tag + ':' if tag else ''}{item_id}:{number or 0}")   # a new icon style uploads afresh
         if key not in self.store.state.icons:
             try:
-                ref = await self.yoto.upload_icon(await self.icon_png(item_id, pos), f"abs-{item_id[:8]}-{number or 0}")
+                ref = await self.yoto.upload_icon(await self.icon_png(slot, item_id, pos), f"abs-{item_id[:8]}-{number or 0}")
             except Exception as e:
                 self.icon_upload_error = str(e)[:200]
                 log.warning("chapter icons for offline copies are off: icon upload failed (%s). "
@@ -164,6 +282,7 @@ class Bridge:
             if ids:
                 await self.control.connect(ids)
             self.last_error = ""
+            self.offline.resume_interrupted()        # copies a restart cut short carry on
         except YotoNotLoggedIn:
             pass
         except Exception as e:
@@ -182,7 +301,7 @@ class Bridge:
             multi = len({s.item_id for s in segs}) > 1
             base = f"{self.cfg.public_url}/s"
             tracks = [{"key": f"{i:02d}", "title": self.track_title(seg, multi), "url": f"{base}/{slot.slot}/{lid}/{i}.mp3",
-                       "icon_url": f"{base}/icon/{slot.slot}/{lid}/{i}.png" if self.cfg.chapter_icons else None}
+                       "icon_url": self.track_icon_url(slot, lid, i)}
                       for i, seg in enumerate(segs, 1)]
             slot.yoto_card_id = await self.yoto.save_stream_tracks_playlist(
                 title, tracks, card_id=slot.yoto_card_id or None, cover_url=cover_url, description=description)
@@ -283,7 +402,7 @@ async def stream_icon(request: web.Request) -> web.Response:
             pos = float(prog.get("currentTime") or 0)
         except ABSError:
             pass
-    body = await br.icon_png(item_id, pos)
+    body = await br.icon_png(slot, item_id, pos)
     return web.Response(body=body, content_type="image/png", headers={"Cache-Control": "no-cache"})
 
 
@@ -298,7 +417,7 @@ async def stream_track_icon(request: web.Request) -> web.Response:
         seg = None
     if not seg:
         raise web.HTTPNotFound()
-    body = await br.icon_png(seg.item_id, seg.start + 0.5 if seg.chaptered else None)
+    body = await br.icon_png(slot, seg.item_id, seg.start + 0.5)
     return web.Response(body=body, content_type="image/png", headers={"Cache-Control": "max-age=86400"})
 
 
@@ -344,6 +463,17 @@ async def resolve_track(br: Bridge, slot, layout_id: str, k: int, probe: bool = 
         if pending[0] != k:
             return {"jump": pending[0], "pending": True}   # still moving: more silence, no second command
     elif pb and not br.pm.card_out_since_start(pb):
+        if pb.layout == layout_id and pb.track == k and pb.item_id == seg.item_id:
+            # the same track again: a Yoto hangs up on pause and asks for the track afresh on resume
+            # (no Range header), so carry on from where it was rather than from the top of the track
+            # where it paused: after a card goes back in, the player reports "playing" seconds before it
+            # asks for the audio, and the clock would count that wait as listening
+            pos = pb.pause_pos if pb.pause_pos is not None else br.pm.position(pb)
+            if seg.start < pos < seg.end - 1:
+                back = br.pm.pause_rewind(pb)
+                req["start"] = max(seg.start, pos - back)
+                if not probe:
+                    log.info("%s: resuming track %d at %.0fs (%.0fs back)", seg.book, k, req["start"], back)
         return req                                   # within a listen: next/previous/auto-advance, whole chapter
     key = br.cfg.abs_key_for(slot.device_id or br.pm._device_from_events(slot.yoto_card_id))
     if slot.series_id:
@@ -361,6 +491,13 @@ async def resolve_track(br: Bridge, slot, layout_id: str, k: int, probe: bool = 
             br.pm.exact_next.discard(slot.slot)
             br.jumping.pop(slot.slot, None)          # the player is where it should be
         req["start"] = max(seg.start, start)         # a plain tap on the listener's chapter: resume
+        return req
+    if slot.offline and layout_id == slot.layout_id:
+        # an offline copy still uploading: its uploaded tracks play from the card, so a request for a
+        # streamed one is the listener choosing it (skip, next track), never a stale resume to correct
+        if not probe:
+            br.pm.exact_next.discard(slot.slot)
+            br.jumping.pop(slot.slot, None)
         return req
     right = chapter_tracks.track_for(slot, item, start) if layout_id == slot.layout_id else None
     if right and right != k and br.control.connected and not pending:
@@ -522,7 +659,11 @@ async def api_status(request):
         "yoto_logged_in": br.auth.logged_in, "yoto_client_id_set": bool(br.cfg.yoto_client_id),
         "login_pending": br.auth.pending if br.auth.pending and br.auth.pending["expires_at"] > time.time() else None, "mqtt": br.control.connected, "devices": devices,
         "pin_required": bool(br.cfg.ui_pin), "icon_upload_error": br.icon_upload_error, "resume_mode": br.cfg.resume_mode, "error": br.last_error, "speeds": list(SPEEDS),
-        "problems": br.alerts.problems, "alerts": br.alerts.enabled})
+        "problems": br.alerts.problems, "alerts": br.alerts.enabled,
+        "icons": {"styles": [{"id": k, "label": v} for k, v in icons.STYLES.items()],
+                  "style": br.store.state.icon_style or icons.DEFAULT_STYLE,
+                  "allow_all": br.store.state.icon_allow_all, "enabled": br.cfg.chapter_icons,
+                  "ai": {"enabled": br.ai.s.enabled, "mode": br.ai.s.mode}}})
 
 
 async def health(request):
@@ -836,6 +977,166 @@ async def api_card_speed(request):
     return web.json_response({"ok": True, "speed": slot.speed})
 
 
+def _card(br, request):
+    slot = br.store.get(request.match_info["slot"])
+    if not slot or slot.kind != "card":
+        raise web.HTTPNotFound()
+    return slot
+
+
+async def api_icon_defaults(request):
+    """The icon style of every card without its own, and whether theme icons may be anything."""
+    require_pin(request)
+    br: Bridge = request.app[BRIDGE]
+    body = await request.json()
+    if "style" in body:
+        style = body["style"] or icons.DEFAULT_STYLE
+        if style not in icons.STYLES or style == "custom":
+            raise web.HTTPBadRequest(text="unknown icon style")
+        br.store.state.icon_style = "" if style == icons.DEFAULT_STYLE else style
+    if "allow_all" in body:
+        br.store.state.icon_allow_all = bool(body["allow_all"])
+    br.store.save()
+    await br.apply_icon_style()
+    return web.json_response({"ok": True, "style": br.store.state.icon_style or icons.DEFAULT_STYLE,
+                              "allow_all": br.store.state.icon_allow_all})
+
+
+async def api_card_icon(request):
+    """A card's own icon style; "" = the default style."""
+    require_pin(request)
+    br: Bridge = request.app[BRIDGE]
+    slot = _card(br, request)
+    style = (await request.json()).get("style") or ""
+    if style and style not in icons.STYLES:
+        raise web.HTTPBadRequest(text="unknown icon style")
+    if style == "custom" and not (slot.icon_custom or slot.icon_chapters):
+        raise web.HTTPBadRequest(text="Choose a picture for this card first.")
+    slot.icon_style = style
+    br.store.save()
+    await br.apply_icon_style([slot])
+    return web.json_response({"ok": True, "icon_style": slot.icon_style, "playing": slot.slot in br.pm.by_slot})
+
+
+async def api_card_icon_image(request):
+    """A picture of the owner's choosing for a card (any image format ffmpeg reads), shrunk to
+    16x16; the card switches to the custom style."""
+    require_pin(request)
+    br: Bridge = request.app[BRIDGE]
+    slot = _card(br, request)
+    px = await icons.shrink_cover(await request.read())
+    if not px:
+        raise web.HTTPBadRequest(text="That picture could not be read.")
+    path = br.custom_icon_path(slot)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(px)
+    slot.icon_custom = hashlib.sha1(px).hexdigest()[:8]
+    slot.icon_style = "custom"
+    br.store.save()
+    await br.apply_icon_style([slot])
+    return web.json_response({"ok": True, "icon_style": slot.icon_style, "playing": slot.slot in br.pm.by_slot})
+
+
+async def api_card_chapter_icons(request):
+    """The chapters of the book a card is on, with which have a picture of their own."""
+    br: Bridge = request.app[BRIDGE]
+    slot = _card(br, request)
+    if not slot.item_id:
+        return web.json_response([])
+    chapters = await br.chapters(slot.item_id)
+    if len(chapters) < 2:
+        return web.json_response([])
+    return web.json_response([{"item_id": slot.item_id, "number": n, "title": c.get("title") or f"Chapter {n}",
+                               "picture": slot.icon_chapters.get(f"{slot.item_id}:{n}", "")}
+                              for n, c in enumerate(chapters, 1)])
+
+
+def _chapter_key(br, slot, request) -> str:
+    try:
+        n = int(request.match_info["n"])
+    except ValueError:
+        raise web.HTTPBadRequest()
+    item = request.match_info["item"]
+    if item != slot.item_id and not any(s.get("item_id") == item for segs in slot.layouts.values() for s in segs):
+        raise web.HTTPNotFound()
+    return f"{item}:{n}"
+
+
+async def api_card_chapter_icon(request):
+    """PUT: a picture for one chapter of a card (the card switches to custom pictures); DELETE: remove it.
+    GET: that picture, enlarged on the page."""
+    br: Bridge = request.app[BRIDGE]
+    slot = _card(br, request)
+    if request.method not in ("GET", "PUT", "DELETE"):
+        raise web.HTTPMethodNotAllowed(request.method, ["GET", "PUT", "DELETE"])
+    key = _chapter_key(br, slot, request)
+    path = br.custom_icon_path(slot, key)
+    if request.method == "GET":
+        if key not in slot.icon_chapters or not path.exists():
+            raise web.HTTPNotFound()
+        return web.Response(body=icons.png(path.read_bytes()), content_type="image/png", headers={"Cache-Control": "no-cache"})
+    require_pin(request)
+    if request.method == "DELETE":
+        slot.icon_chapters.pop(key, None)
+        path.unlink(missing_ok=True)
+    else:
+        px = await icons.shrink_cover(await request.read())
+        if not px:
+            raise web.HTTPBadRequest(text="That picture could not be read.")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(px)
+        slot.icon_chapters[key] = hashlib.sha1(px).hexdigest()[:8]
+        slot.icon_style = "custom"
+    br.store.save()
+    await br.apply_icon_style([slot])
+    return web.json_response({"ok": True, "icon_style": slot.icon_style, "playing": slot.slot in br.pm.by_slot})
+
+
+async def api_card_ai_pictures(request):
+    """POST: make AI pictures for the chapters of the card's book that have none ({"overwrite": true}: all);
+    DELETE: stop."""
+    require_pin(request)
+    br: Bridge = request.app[BRIDGE]
+    slot = _card(br, request)
+    if request.method == "DELETE":
+        br.ai.cancel(slot.slot)
+        return web.json_response({"ok": True})
+    if not slot.item_id:
+        raise web.HTTPBadRequest(text="This card has no book.")
+    body = await request.json() if request.can_read_body else {}
+    try:
+        job = br.ai.start(slot, bool(body.get("overwrite")))
+    except RuntimeError as e:
+        raise web.HTTPBadRequest(text=str(e))
+    return web.json_response(job)
+
+
+async def api_card_icon_preview(request):
+    """The card's icon for the chapter it is at, in its style or ?style=, for the page (shown enlarged)."""
+    br: Bridge = request.app[BRIDGE]
+    slot = _card(br, request)
+    if not slot.item_id:
+        raise web.HTTPNotFound()
+    style = request.query.get("style") or None
+    if style and (style not in icons.STYLES or style == "custom" and not (slot.icon_custom or slot.icon_chapters)):
+        style = None
+    if (style or br.icon_style(slot)) == "none":
+        raise web.HTTPNotFound()
+    pb = br.pm.by_slot.get(slot.slot)
+    if pb:
+        book, pos = br.pm.book_position(pb)
+        item_id = book.item_id
+    else:
+        item_id, pos = slot.item_id, 0.0
+        try:
+            prog = await br.abs.progress(item_id, br.cfg.abs_key_for(slot.device_id)) or {}
+            pos = float(prog.get("currentTime") or 0)
+        except ABSError:
+            pass
+    body = await br.icon_png(slot, item_id, pos, style)
+    return web.Response(body=body, content_type="image/png", headers={"Cache-Control": "no-cache"})
+
+
 async def api_control(request):
     br: Bridge = request.app[BRIDGE]
     body = await request.json()
@@ -852,6 +1153,8 @@ async def api_cards(request):
                                "yoto_card_id": s.yoto_card_id, "yoto_title": s.yoto_title,
                                "stream_url": br.stream_url(s.slot), "offline": _offline_info(s),
                                "series_id": s.series_id, "series_name": s.series_name, "speed": s.speed,
+                               "icon_style": s.icon_style, "icon_custom": bool(s.icon_custom),
+                               "icon_chapters": len(s.icon_chapters), "ai_job": br.ai.status(s.slot),
                                "group_kind": (s.group_kind or "series") if s.series_id else ""}
                               for s in br.store.cards()])
 
@@ -860,13 +1163,14 @@ def _offline_info(s) -> dict | None:
     o = s.offline
     if not o:
         return None
-    keep = ("status", "step", "error", "hours", "speed", "start", "end", "last_pos", "last_event_at",
-            "from_title", "to_title", "last_book")
+    keep = ("status", "step", "error", "mode", "hours", "speed", "start", "end", "last_pos", "last_event_at",
+            "from_title", "to_title", "last_book", "books_left_off", "on_card")
     return {**{k: o[k] for k in keep if k in o}, "tracks": len(o.get("tracks", []))}
 
 
 async def api_card_offline(request):
-    """Make offline: upload the next hours of the card's book to the card as ordinary Yoto tracks."""
+    """Make offline: upload the next hours of the card's book (mode "next"), the whole book ("book") or the
+    whole series from the current book ("series") to the card as ordinary Yoto tracks."""
     require_pin(request)
     br: Bridge = request.app[BRIDGE]
     slot = br.store.get(request.match_info["slot"])
@@ -874,7 +1178,7 @@ async def api_card_offline(request):
         raise web.HTTPNotFound()
     body = await request.json() if request.can_read_body else {}
     try:
-        info = br.offline.start(slot, body.get("hours"), body.get("speed"))
+        info = br.offline.start(slot, body.get("hours"), body.get("speed"), body.get("mode"), body.get("redo_from"))
     except ValueError as e:
         raise web.HTTPConflict(text=str(e))
     return web.json_response(info)
@@ -953,9 +1257,15 @@ async def api_card_delete(request):
     require_pin(request)
     br: Bridge = request.app[BRIDGE]
     await br.pm.finish_slot(request.match_info["slot"], "card removed")
+    br.ai.cancel(request.match_info["slot"])
     task = br.offline.tasks.pop(request.match_info["slot"], None)
     if task:
         task.cancel()
+    slot = br.store.get(request.match_info["slot"])
+    if slot and slot.icon_custom:
+        br.custom_icon_path(slot).unlink(missing_ok=True)
+    if slot and slot.icon_chapters:
+        shutil.rmtree(br.custom_icon_path(slot, "x:0").parent, ignore_errors=True)
     br.store.delete(request.match_info["slot"])
     return web.json_response({"ok": True})
 
@@ -997,6 +1307,8 @@ def make_app(br: Bridge) -> web.Application:
     r.add_get(CALLBACK_PATH, yoto_callback)
     r.add_get("/s/icon/{slot}.png", stream_icon)
     r.add_get("/s/icon/{slot}/{layout}/{k}.png", stream_track_icon)
+    r.add_get("/s/icon/{tag}/{slot}.png", stream_icon)              # the same, in a non-default style
+    r.add_get("/s/icon/{tag}/{slot}/{layout}/{k}.png", stream_track_icon)
     r.add_route("GET", "/s/{slot}/{layout}/{k}.mp3", stream_track)
     r.add_route("HEAD", "/s/{slot}/{layout}/{k}.mp3", stream_track)
     r.add_get("/s/health", health)
@@ -1026,6 +1338,14 @@ def make_app(br: Bridge) -> web.Application:
     r.add_post("/api/cards/{slot}/offline", api_card_offline)
     r.add_post("/api/cards/{slot}/online", api_card_online)
     r.add_put("/api/cards/{slot}/speed", api_card_speed)
+    r.add_put("/api/cards/{slot}/icon", api_card_icon)
+    r.add_put("/api/cards/{slot}/icon/image", api_card_icon_image)
+    r.add_get("/api/cards/{slot}/icon.png", api_card_icon_preview)
+    r.add_get("/api/cards/{slot}/icon/chapters", api_card_chapter_icons)
+    r.add_route("*", "/api/cards/{slot}/icon/chapters/{item}/{n}", api_card_chapter_icon)
+    r.add_post("/api/icons", api_icon_defaults)
+    r.add_post("/api/cards/{slot}/icon/ai", api_card_ai_pictures)
+    r.add_delete("/api/cards/{slot}/icon/ai", api_card_ai_pictures)
     r.add_delete("/api/cards/{slot}", api_card_delete)
     chapter_api.register(app, br, require_pin)
     transfer.register(app, br, require_pin, _point_card)

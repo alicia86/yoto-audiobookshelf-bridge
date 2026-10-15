@@ -1,4 +1,4 @@
-import { Layers, Play, Plus, Search } from "lucide-react"
+import { Layers, Loader2, Play, Plus, Search } from "lucide-react"
 import { useEffect, useMemo, useState } from "react"
 
 import { BookCover } from "@/components/book-cover"
@@ -29,6 +29,8 @@ export function LibraryView(props: {
   const [debounced, setDebounced] = useState("")
   const [books, setBooks] = useState<Book[] | null>(null)
   const [error, setError] = useState("")
+  const [searchError, setSearchError] = useState("")
+  const [slow, setSlow] = useState(false)
 
   useEffect(() => {
     api<Library[]>("/api/libraries").then(
@@ -45,11 +47,24 @@ export function LibraryView(props: {
   }, [query])
   useEffect(() => {
     if (!lib) return
+    let stale = false
     setBooks(null)
+    setSearchError("")
+    setSlow(false)
+    const slowTimer = setTimeout(() => !stale && setSlow(true), 5000)
     api<{ items: Book[] }>(`/api/books?library=${encodeURIComponent(lib)}&q=${encodeURIComponent(debounced)}`).then(
-      (r) => setBooks(r.items),
-      (e) => setError(errorText(e)),
-    )
+      (r) => !stale && setBooks(r.items),
+      // A failed search stays below the search box, so the next search can still replace it.
+      (e) => {
+        if (stale) return
+        setBooks([])
+        setSearchError(errorText(e) || "Search failed, try again")
+      },
+    ).finally(() => clearTimeout(slowTimer))
+    return () => {
+      stale = true
+      clearTimeout(slowTimer)
+    }
   }, [lib, debounced])
 
   const bookSheet = (b: Book) => {
@@ -106,7 +121,13 @@ export function LibraryView(props: {
           <Input type="search" placeholder="Search books" className="pl-8" value={query} onChange={(e) => setQuery(e.target.value)} />
         </div>
       </div>
-      {books && !books.length ? <Empty>No books found</Empty> : <div className="grid grid-cols-[repeat(auto-fill,minmax(120px,1fr))] gap-3">{grid}</div>}
+      {!books && (
+        <p className="flex items-center gap-2 text-sm text-muted-foreground">
+          <Loader2 className="size-4 animate-spin" />
+          {slow ? "Audiobookshelf is slow to answer, still waiting…" : debounced ? "Searching…" : "Loading books…"}
+        </p>
+      )}
+      {searchError ? <Empty>{searchError}</Empty> : books && !books.length ? <Empty>No books found</Empty> : <div className="grid grid-cols-[repeat(auto-fill,minmax(120px,1fr))] gap-3">{grid}</div>}
     </div>
   )
 }

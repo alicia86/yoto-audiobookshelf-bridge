@@ -23,6 +23,9 @@ yoto_client_id: "paste-yoto-client-id"
 # chapter_tracks: true           # one Yoto track per chapter: the player's next/previous skip chapters
 # chapter_icons: true            # cover + chapter number on the Yoto's display (offline copies need the user:icons:manage scope)
 # offline_hours: 5               # how much of a book "Make offline" puts on the card (Yoto max 5)
+# offline_whole_track_seconds: 0  # longest track of a whole-book/series offline copy in seconds (0 = just under 2 h,
+                                  #   3300 keeps to Yoto's stated 60 min per track)
+# offline_max_mb: 0              # size limit for whole-book/series offline copies in MB (0 = none)
 # chapters_api_key: "key-of-an-ABS-user-who-may-edit-books"   # Chapters tab: needed if abs_api_key's user can't edit
 # audible_region: us            # Chapters tab: Audible store for chapter lists (us, uk, ca, au, de, fr, it, es, jp, in)
 # ui_pin: "4321"                # PIN for making/changing cards on the phone page
@@ -34,6 +37,15 @@ yoto_client_id: "paste-yoto-client-id"
 # ntfy_url: https://ntfy.sh/a-long-random-topic-name
 # ntfy_token: ""                 # only for a protected topic on your own ntfy server
 # alert_check_public: true       # false if this host cannot reach its own public_url
+
+# AI chapter pictures (README "AI chapter pictures"): any services in the OpenAI API format.
+# Without "image", each chapter gets the best-fitting icon from Yoto's library; with it, a drawn picture.
+# ai_pictures:
+#   transcribe: {url: http://192.168.1.30:8081/v1, model: whisper-1}          # e.g. whisper.cpp's server
+#   text: {url: http://192.168.1.30:11434/v1, model: "llama3.2:3b", unload: true}   # e.g. Ollama
+#   # image: {url: http://192.168.1.30:11434, model: "<an Ollama image model>", api: ollama, unload: true}
+#   # or a hosted service: {url: https://api.example.com/v1, model: "<model>", key: "<api key>"}
+#   sample_seconds: 180          # how much of each chapter is listened to
 
 # Per-player overrides. Device ids are printed in the bridge log at startup.
 # devices:

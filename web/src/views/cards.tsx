@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import { toast } from "sonner"
 
 import { BookCover } from "@/components/book-cover"
+import { IconDefaults, IconPreview, IconSheet } from "@/components/icon-styles"
 import { useOverlays } from "@/components/overlays"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -10,7 +11,7 @@ import { Card } from "@/components/ui/card"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import type { Picked } from "@/lib/actions"
 import { api, errorText, hms, SPEEDS, speedLabel } from "@/lib/api"
-import type { CardSlot, Choice } from "@/types"
+import type { CardSlot, Choice, IconSettings, Status } from "@/types"
 import { Empty, ListSkeleton } from "@/views/continue"
 import { TransferSheet } from "@/views/transfer"
 
@@ -45,6 +46,12 @@ export function CardsView(props: {
   const { openSheet, closeSheet, confirm } = useOverlays()
   const [cards, setCards] = useState<CardSlot[] | null>(null)
   const [error, setError] = useState("")
+  const [iconSettings, setIconSettings] = useState<IconSettings | null>(null)
+  useEffect(() => {
+    api<Status>("/api/status")
+      .then((s) => setIconSettings(s.icons ?? null))
+      .catch(() => {})
+  }, [])
   const timer = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const load = useCallback(async () => {
@@ -183,14 +190,15 @@ export function CardsView(props: {
     openSheet({
       title: "Make an offline copy?",
       description:
-        "Copy the next 5 hours of listening (from where it was left; on a series or collection card this runs on into the next books) onto the card as regular Yoto tracks, so it plays without internet. Until you press “Back to streaming”, the card plays the copy and its position is synced to Audiobookshelf whenever the Yoto is online.",
+        "Copy the book onto the card as regular Yoto tracks, so it plays without internet. Until you press “Back to streaming”, the card plays the copy and its position is synced to Audiobookshelf whenever the Yoto is online.",
       body: (
         <OfflineSheet
           speed={card.speed || 1}
+          group={card.series_id ? card.group_kind || "series" : ""}
           onCancel={closeSheet}
-          onStart={(speed) => {
+          onStart={(speed, mode) => {
             closeSheet()
-            run(() => api(`/api/cards/${card.slot}/offline`, { method: "POST", body: { speed } }), "Making offline copy…")
+            run(() => api(`/api/cards/${card.slot}/offline`, { method: "POST", body: { speed, mode } }), "Making offline copy…")
           }}
         />
       ),
@@ -210,6 +218,25 @@ export function CardsView(props: {
       () => api(`/api/cards/${slot}/speed`, { method: "PUT", body: { speed } }),
       speed ? `This card now plays at ${speedLabel(speed)}` : "This card now plays at the player's speed",
     )
+
+  const chooseIcon = (card: CardSlot) =>
+    iconSettings &&
+    openSheet({
+      title: "Pixel icon for this card",
+      description: "What the Yoto's display shows while this card plays.",
+      body: (
+        <IconSheet
+          key={card.slot}
+          card={card}
+          settings={iconSettings}
+          onDone={(msg) => {
+            closeSheet()
+            if (msg) toast.success(msg)
+            reload()
+          }}
+        />
+      ),
+    })
 
   const remove = async (slot: string) => {
     const ok = await confirm({
@@ -276,6 +303,11 @@ export function CardsView(props: {
                     </Button>
                   ))}
                 {c.item_id && <CardSpeed speed={c.speed} onChange={(v) => setSpeed(c.slot, v)} />}
+                {c.item_id && iconSettings?.enabled && (
+                  <Button size="sm" variant="outline" onClick={() => chooseIcon(c)} aria-label="Pixel icon of this card">
+                    <IconPreview slot={c.slot} className="size-5 rounded-sm" /> Icon
+                  </Button>
+                )}
                 <Button size="sm" variant="ghost" className="text-muted-foreground" onClick={() => remove(c.slot)}>
                   <Trash2 /> Forget
                 </Button>
@@ -284,17 +316,64 @@ export function CardsView(props: {
           </Card>
         ))
       )}
+      {iconSettings && <IconDefaults settings={iconSettings} onChange={setIconSettings} />}
       <YotoAccount />
     </div>
   )
 }
 
-function OfflineSheet({ speed: initial, onStart, onCancel }: { speed: number; onStart: (s: number) => void; onCancel: () => void }) {
+type OfflineMode = "next" | "book" | "series"
+
+function OfflineSheet({
+  speed: initial,
+  group,
+  onStart,
+  onCancel,
+}: {
+  speed: number
+  group: "" | "series" | "collection"
+  onStart: (s: number, mode: OfflineMode) => void
+  onCancel: () => void
+}) {
   const [speed, setSpeed] = useState(initial)
+  const [mode, setMode] = useState<OfflineMode>("next")
   const options = SPEEDS.includes(initial) ? SPEEDS : [...SPEEDS, initial].sort((a, b) => a - b)
   const bookHours = Math.round(5 * speed * 10) / 10
+  const modes: { value: OfflineMode; title: string; text: string }[] = [
+    {
+      value: "next",
+      title: "Next 5 hours",
+      text: group
+        ? "From where it was left, running on into the next books."
+        : "From where it was left, cut at chapters.",
+    },
+    { value: "book", title: "Whole book", text: "One chapter per track, from the start of the book." },
+  ]
+  if (group)
+    modes.push({
+      value: "series",
+      title: `Whole ${group}`,
+      text: "Every book from book 1 to the end, each track as long as it takes to fit in 99 tracks. The Yoto still starts where the listener is.",
+    })
   return (
     <div className="flex flex-col gap-3 pb-2 text-sm">
+      <div className="flex flex-col gap-2" role="radiogroup" aria-label="What to copy">
+        {modes.map((m) => (
+          <button
+            key={m.value}
+            type="button"
+            role="radio"
+            aria-checked={mode === m.value}
+            onClick={() => setMode(m.value)}
+            className={`rounded-md border px-3 py-2 text-left transition-colors ${
+              mode === m.value ? "border-primary bg-primary/5" : "hover:bg-muted"
+            }`}
+          >
+            <span className="font-medium">{m.title}</span>
+            <span className="block text-muted-foreground">{m.text}</span>
+          </button>
+        ))}
+      </div>
       <div className="flex items-center justify-between gap-3">
         <span>Speed of the copy</span>
         <Select value={String(speed)} onValueChange={(v) => setSpeed(Number(v))}>
@@ -312,10 +391,15 @@ function OfflineSheet({ speed: initial, onStart, onCancel }: { speed: number; on
         </Select>
       </div>
       <p className="text-muted-foreground">
-        The speed is built into the copy and can't be changed on the Yoto. {speed !== 1 && `At ${speedLabel(speed)} the 5 hours hold about ${bookHours} hours of the book.`}
+        The speed is built into the copy and can't be changed on the Yoto.{" "}
+        {mode === "next"
+          ? speed !== 1 && `At ${speedLabel(speed)} the 5 hours hold about ${bookHours} hours of the book.`
+          : ""}
       </p>
-      <p className="text-muted-foreground">This uploads that audio to Yoto.</p>
-      <Button onClick={() => onStart(speed)}>
+      <p className="text-muted-foreground">
+        This uploads that audio to Yoto.{mode !== "next" && " On the first play the Yoto is moved on to where the book was left."}
+      </p>
+      <Button onClick={() => onStart(speed, mode)}>
         <CloudDownload /> Make offline
       </Button>
       <Button variant="ghost" onClick={onCancel}>
@@ -352,6 +436,7 @@ function OfflineLine({ card }: { card: CardSlot }) {
     return (
       <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
         <CloudDownload className="size-4 shrink-0 animate-pulse" /> Making offline copy: {o.step}…
+        {o.on_card ? ` ${o.on_card} of ${o.tracks} tracks on the card, the rest stream.` : ""}
       </p>
     )
   if (o.status === "failed")
@@ -361,9 +446,15 @@ function OfflineLine({ card }: { card: CardSlot }) {
       </p>
     )
   const span =
-    o.from_title && o.to_title && o.from_title !== o.to_title
-      ? `${o.from_title} ${hms(o.start)} → ${o.to_title} ${hms(o.end)}`
-      : `${hms(o.start)} → ${hms(o.end)}`
+    o.mode === "book"
+      ? "whole book"
+      : o.mode === "series"
+        ? `${o.from_title} to the end${o.to_title && o.to_title !== o.from_title ? ` of ${o.to_title}` : ""}${
+            o.books_left_off ? ` (${o.books_left_off} more didn't fit)` : ""
+          }`
+        : o.from_title && o.to_title && o.from_title !== o.to_title
+          ? `${o.from_title} ${hms(o.start)} → ${o.to_title} ${hms(o.end)}`
+          : `${hms(o.start)} → ${hms(o.end)}`
   return (
     <div className="mt-1 text-sm text-muted-foreground">
       <p className="flex items-center gap-1.5">

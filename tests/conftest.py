@@ -42,6 +42,8 @@ class FakeABS:
         self.calls: list[tuple] = []
         self.sessions: dict[str, dict] = {}
         self.extra: dict[str, dict] = {}         # more books (full item JSON), e.g. for old-card transfer tests
+        self.down = 0                            # answer this many session requests with 503 (ABS away)
+        self.down_files = 0                      # and this many audio file requests
 
     SERIES = {"li1": "1", "li2": "2", "li3": "10"}   # series "ser1", sequence per book
 
@@ -110,6 +112,9 @@ class FakeABS:
             return web.json_response(self.item(r.match_info["id"]))
 
         async def play(r):
+            if self.down > 0:
+                self.down -= 1
+                return web.Response(status=503, text="restarting")
             iid = r.match_info["id"]
             body = await r.json()
             sid = f"ps_{len(self.sessions) + 1}"
@@ -157,6 +162,9 @@ class FakeABS:
             return web.json_response({"book": [{"libraryItem": h} for h in hits], "series": []})
 
         async def file(r):
+            if self.down_files > 0:
+                self.down_files -= 1
+                return web.Response(status=503, text="restarting")
             return web.FileResponse(self.audio_dir / FILES[int(r.match_info["n"])][0])
 
         async def cover(r):
@@ -187,9 +195,17 @@ class FakeYotoAPI:
         self.uploads: dict[str, bytes] = {}      # uploadId -> MP3 bytes the bridge PUT
         self.polls: dict[str, int] = {}
         self.fail_uploads = False
+        self.stuck: set[str] = set()            # upload ids Yoto never finishes processing
         self.icons: list[bytes] = []
         self.icon_status = 200                  # 403 = the app lacks the user:icons:manage scope
         self.base = ""                           # set once the server is up, for signed upload URLs
+        self.library = [                         # Yoto's public icons: (mediaId, title, tags, colour)
+            ("m-dragon", "Dragon", ["fantasy", "animal"], (200, 40, 40)),
+            ("m-sword", "Sword", ["knight", "dragon"], (180, 180, 190)),
+            ("m-castle", "Castle", ["knight", "princess"], (120, 120, 200)),
+            ("m-redcastle", "Big Red Castle", ["building"], (220, 60, 60)),
+        ]
+        self.library_requests = 0
 
     def app(self):
         a = web.Application()
@@ -242,7 +258,7 @@ class FakeYotoAPI:
         async def transcoded(r):
             uid = r.match_info["uid"]
             self.polls[uid] = self.polls.get(uid, 0) + 1
-            if self.polls[uid] < 2:                  # first poll: still transcoding
+            if self.polls[uid] < 2 or uid in self.stuck:   # first poll: still transcoding
                 return web.json_response({"transcode": {}})
             data = self.uploads[uid]
             return web.json_response({"transcode": {"transcodedSha256": f"sha-{uid}", "transcodedInfo": {
@@ -254,7 +270,20 @@ class FakeYotoAPI:
             self.icons.append(await r.read())
             return web.json_response({"displayIcon": {"mediaId": f"icon{len(self.icons)}", "new": True}})
 
+        async def public_icons(r):
+            self.library_requests += 1
+            return web.json_response({"displayIcons": [
+                {"mediaId": m, "userId": "yoto", "title": t, "publicTags": tags, "url": f"{self.base}/iconfile/{m}.png",
+                 "public": True, "new": True, "displayIconId": f"d-{m}"} for m, t, tags, _ in self.library]})
+
+        async def icon_file(r):
+            from yotobridge.icons import png
+            colour = next(c for m, _, _, c in self.library if m == r.match_info["m"])
+            return web.Response(body=png(bytes([*colour, 255]) * 256), content_type="image/png")
+
         a.router.add_post("/media/displayIcons/user/me/upload", upload_icon)
+        a.router.add_get("/media/displayIcons/user/yoto", public_icons)
+        a.router.add_get("/iconfile/{m}.png", icon_file)
         a.router.add_get("/media/transcode/audio/uploadUrl", upload_url)
         a.router.add_put("/signed/{uid}", signed_put)
         a.router.add_get("/media/upload/{uid}/transcoded", transcoded)

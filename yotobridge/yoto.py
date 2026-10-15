@@ -137,7 +137,8 @@ def _describe(body: dict) -> str:
 
 class YotoAPI:
     TRANSCODE_POLL = 2.0        # seconds between checks while Yoto transcodes an upload
-    TRANSCODE_TIMEOUT = 900
+    TRANSCODE_TIMEOUT = 900     # a job not done in this long is given up and the track uploaded again
+    TRANSCODE_TRIES = 3         # uploads of one track before the copy fails
 
     def __init__(self, http: aiohttp.ClientSession, auth: YotoAuth, base: str):
         self.http = http
@@ -249,24 +250,31 @@ class YotoAPI:
 
     async def upload_audio(self, audio: bytes, title: str) -> dict:
         """Upload one MP3 as MYO audio (yoto.dev "uploading to cards"): get a signed URL, PUT the file,
-        wait for Yoto's transcode. Returns the track fields for a playlist."""
-        up = (await self._req("GET", "/media/transcode/audio/uploadUrl")).get("upload", {})
-        async with self.http.put(up["uploadUrl"], data=audio, headers={"Content-Type": "audio/mpeg"},
-                                 timeout=aiohttp.ClientTimeout(total=1800)) as r:
-            if r.status >= 400:
-                raise RuntimeError(f"Yoto upload of {title} -> {r.status}: {(await r.text())[:200]}")
-        deadline = time.monotonic() + self.TRANSCODE_TIMEOUT
-        while True:
-            t = (await self._req("GET", f"/media/upload/{up['uploadId']}/transcoded",
-                                 params={"loudnorm": "false"})).get("transcode", {})
-            if t.get("transcodedSha256"):
-                info = t.get("transcodedInfo") or {}
-                return {"sha": t["transcodedSha256"], "duration": info.get("duration"),
-                        "fileSize": info.get("fileSize"), "channels": info.get("channels") or "mono",
-                        "format": info.get("format") or "mp3"}
-            if time.monotonic() > deadline:
-                raise RuntimeError(f"Yoto did not finish processing {title} in time")
-            await asyncio.sleep(self.TRANSCODE_POLL)
+        wait for Yoto's transcode. Returns the track fields for a playlist. Yoto sometimes never finishes
+        a job (seen: a 2 h track still processing after 15 min, when others that long took 1-2 min), so
+        a job that takes longer than TRANSCODE_TIMEOUT is given up and the track uploaded again."""
+        for attempt in range(1, self.TRANSCODE_TRIES + 1):
+            up = (await self._req("GET", "/media/transcode/audio/uploadUrl")).get("upload", {})
+            async with self.http.put(up["uploadUrl"], data=audio, headers={"Content-Type": "audio/mpeg"},
+                                     timeout=aiohttp.ClientTimeout(total=1800)) as r:
+                if r.status >= 400:
+                    raise RuntimeError(f"Yoto upload of {title} -> {r.status}: {(await r.text())[:200]}")
+            began = time.monotonic()
+            while time.monotonic() - began < self.TRANSCODE_TIMEOUT:
+                t = (await self._req("GET", f"/media/upload/{up['uploadId']}/transcoded",
+                                     params={"loudnorm": "false"})).get("transcode", {})
+                if t.get("transcodedSha256"):
+                    log.info("Yoto processed %s in %.0fs", title, time.monotonic() - began)
+                    info = t.get("transcodedInfo") or {}
+                    return {"sha": t["transcodedSha256"], "duration": info.get("duration"),
+                            "fileSize": info.get("fileSize"), "channels": info.get("channels") or "mono",
+                            "format": info.get("format") or "mp3"}
+                await asyncio.sleep(self.TRANSCODE_POLL)
+            if attempt < self.TRANSCODE_TRIES:
+                log.warning("Yoto has not finished processing %s after %.0f min; uploading it again (try %d of %d)",
+                            title, self.TRANSCODE_TIMEOUT / 60, attempt + 1, self.TRANSCODE_TRIES)
+        raise RuntimeError(f"Yoto did not finish processing {title} in {self.TRANSCODE_TRIES} tries of "
+                           f"{self.TRANSCODE_TIMEOUT / 60:.0f} min")
 
     async def save_track_playlist(self, title: str, tracks: list[dict], card_id: str,
                                   cover_url: str | None = None, description: str = "") -> str:
@@ -288,6 +296,38 @@ class YotoAPI:
                       "metadata": {"description": description,
                                    "media": {"duration": sum(t.get("duration") or 0 for t in tracks),
                                              "fileSize": size, "readableFileSize": round(size / 1e6, 1)}}}
+        if cover_url:
+            body["metadata"]["cover"] = {"imageL": cover_url}
+        r = await self._req("POST", "/content", json=body)
+        card = r.get("card", r)
+        return card.get("cardId") or card_id
+
+
+    async def save_mixed_playlist(self, title: str, tracks: list[dict], card_id: str,
+                                  cover_url: str | None = None, description: str = "") -> str:
+        """An offline copy still uploading: tracks already uploaded ({"sha", ...}, as for
+        save_track_playlist) play from the card, the rest ({"url", "icon_url"}) stream from the bridge."""
+        chapters = []
+        for t in tracks:
+            label = str(int(t["key"]))
+            if t.get("sha"):
+                track = {"key": t["key"], "title": t["title"], "overlayLabel": label, "type": "audio",
+                         "trackUrl": f"yoto:#{t['sha']}", "duration": t.get("duration"), "fileSize": t.get("fileSize"),
+                         "channels": t.get("channels"), "format": t.get("format"),
+                         "display": {"icon16x16": t["icon"]} if t.get("icon") else None}
+                display = {"icon16x16": t["icon"]} if t.get("icon") else None
+            else:
+                track = {"key": t["key"], "title": t["title"], "overlayLabel": label, "type": "stream",
+                         "format": "mp3", "trackUrl": t["url"],
+                         "display": {"iconUrl16x16": t["icon_url"]} if t.get("icon_url") else None}
+                display = {"iconUrl16x16": t["icon_url"]} if t.get("icon_url") else None
+            chapter = {"key": t["key"], "title": t["title"], "overlayLabel": label,
+                       "tracks": [{k: v for k, v in track.items() if v is not None}]}
+            if display:
+                chapter["display"] = display
+            chapters.append(chapter)
+        body: dict = {"title": title, "cardId": card_id, "content": {"chapters": chapters},
+                      "metadata": {"description": description}}
         if cover_url:
             body["metadata"]["cover"] = {"imageL": cover_url}
         r = await self._req("POST", "/content", json=body)

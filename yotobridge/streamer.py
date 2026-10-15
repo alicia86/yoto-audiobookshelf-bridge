@@ -21,6 +21,10 @@ log = logging.getLogger(__name__)
 CHUNK = 16 * 1024
 
 
+class SourceError(Exception):
+    """The audio source stopped sending part-way through (Audiobookshelf went away, say)."""
+
+
 @dataclass
 class Track:
     url: str
@@ -54,8 +58,10 @@ class Encoder:
         return self._silence
 
     async def stream(self, tracks: list[Track], start: float, end: float, auth_header: str,
-                     speed: float = 1.0) -> AsyncIterator[bytes]:
-        """Yield MP3 bytes covering book time [start, end), played at `speed`."""
+                     speed: float = 1.0, strict: bool = False) -> AsyncIterator[bytes]:
+        """Yield MP3 bytes covering book time [start, end), played at `speed`. With `strict`, a file
+        ffmpeg could not read to the end raises SourceError instead of leaving a gap (an offline copy
+        would otherwise upload silence where the audio should be)."""
         for t in tracks:
             t_end = t.start + t.duration
             if t_end <= start or t.start >= end:
@@ -74,16 +80,22 @@ class Encoder:
             args += self._out_args()
             proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE,
                                                         stderr=asyncio.subprocess.PIPE)
+            got = 0
             try:
                 while True:
                     chunk = await proc.stdout.read(CHUNK)
                     if not chunk:
                         break
+                    got += len(chunk)
                     yield chunk
                 await proc.wait()
                 if proc.returncode:
                     err = (await proc.stderr.read()).decode(errors="replace")[-400:]
                     log.warning("ffmpeg exited %s on %s: %s", proc.returncode, t.url, err)
+                    want = length / speed * self.byterate
+                    if strict and got < want - 2 * self.byterate:
+                        raise SourceError(f"the audio stopped after {got / self.byterate / 60:.0f} of "
+                                          f"{want / self.byterate / 60:.0f} min ({' '.join(err.split())[-120:] or 'ffmpeg failed'})")
             finally:
                 if proc.returncode is None:
                     proc.kill()

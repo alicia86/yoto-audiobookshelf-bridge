@@ -63,13 +63,29 @@ def _raw_spans(chapters: list[dict], duration: float, part_seconds: int) -> list
             if end - start > 0.5:
                 spans.append((start, end, c.get("title") or f"Chapter {i + 1}"))
         if spans:
-            return spans
+            return _fill_gaps(spans, duration, part_seconds)
     out, t, n = [], 0.0, 1
     while t < duration - 0.5:
         out.append((t, min(duration, t + part_seconds), f"Part {n}"))
         t += part_seconds
         n += 1
     return out or [(0.0, duration, "Part 1")]
+
+
+def _fill_gaps(spans: list[tuple[float, float, str]], duration: float,
+               part_seconds: int) -> list[tuple[float, float, str]]:
+    """Cover audio no chapter covers (broken chapter data: a 20 h book listed as one 2 h chapter and an
+    empty one) with parts of part_seconds, so every second of the book is on some track."""
+    out, t, n = [], 0.0, 1
+    for start, end, title in spans + [(duration, duration, "")]:
+        while start - t > 0.5:
+            e = min(start, t + part_seconds)
+            out.append((t, e, f"Part {n}"))
+            t, n = e, n + 1
+        if title:
+            out.append((start, end, title))
+        t = max(t, end)
+    return out
 
 
 def index_at(spans: list[tuple[float, float, str]], pos: float) -> int:

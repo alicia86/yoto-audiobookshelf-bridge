@@ -1,3 +1,4 @@
+import math
 import array
 import asyncio
 import subprocess
@@ -388,7 +389,7 @@ async def test_login_by_pasting_landing_address(env):
 
 # ---------------------------------------------------------------- offline copies
 
-from yotobridge.offline import plan_segments  # noqa: E402
+from yotobridge.offline import plan_segments, plan_whole  # noqa: E402
 
 
 def test_plan_segments_cuts_at_chapters_and_splits_long_ones():
@@ -520,6 +521,363 @@ async def test_failed_upload_leaves_card_streaming(env):
     info = await _wait_offline(client, s.slot)
     assert info["status"] == "failed" and "500" in info["error"]
     assert env.yoto.posts[-1]["content"]["chapters"][0]["tracks"][0]["type"] == "stream"
+
+
+def test_plan_whole_one_chapter_per_track_when_it_fits():
+    # 10, 10, 70 (a book listed as one huge chapter), 10 and 10 minutes
+    starts = [0, 600, 1200, 5400, 6000]
+    ch = [{"start": st, "title": f"Ch {i + 1}"} for i, st in enumerate(starts)]
+    dur = 6600
+    [plan] = plan_whole([(ch, dur)], math.inf)
+    assert [t[2] for t in plan] == ["Ch 1", "Ch 2", "Ch 3 (1/3)", "Ch 3 (2/3)", "Ch 3 (3/3)", "Ch 4", "Ch 5"]
+    assert plan[0][0] == 0 and plan[-1][1] == dur
+    assert all(a[1] == b[0] for a, b in zip(plan, plan[1:]))
+
+
+def test_plan_whole_series_fills_tracks_to_stay_under_99():
+    # 6 books x 40 chapters of 5 min = 240 chapters, 20 h: tracks have to hold several chapters
+    books = [([{"start": i * 300, "end": (i + 1) * 300, "title": f"B{b} C{i + 1}"} for i in range(40)], 40 * 300)
+             for b in range(6)]
+    plans = plan_whole(books, 3300)
+    n = sum(len(p) for p in plans)
+    assert n == 84          # 3 chapters a track (14 per book); 2 a track would be 120, over 99
+    for p, (_, dur) in zip(plans, books):
+        assert p[0][0] == 0 and p[-1][1] == dur            # each book whole, no track spans two books
+        assert all(a[1] == b[0] for a, b in zip(p, p[1:]))
+        assert all(e - s <= 3300 for s, e, _ in p)
+        assert all(round(s) % 300 == 0 for s, _, _ in p)   # cut only at chapter boundaries
+    assert plans[0][0][2] == "B0 C1 – B0 C3"
+
+
+def test_plan_whole_without_a_track_limit_keeps_chapters_up_to_an_hour():
+    ch = [{"start": 0, "end": 3500, "title": "Long"}, {"start": 3500, "end": 3800, "title": "Short"}]
+    [plan] = plan_whole([(ch, 3800)], math.inf)
+    assert plan == [(0, 3500, "Long"), (3500, 3800, "Short")]
+    books = [([{"start": i * 300, "end": (i + 1) * 300, "title": f"C{i}"} for i in range(150)], 45000)] * 2
+    plans = plan_whole(books, math.inf)
+    assert sum(len(p) for p in plans) <= 99 and all(p[-1][1] == 45000 for p in plans)
+
+
+def test_plan_whole_never_makes_a_whole_long_book_one_track():
+    """A 19 h book with one "chapter" (or none) goes in 30 min parts, packed to fit 99 tracks; a 19 h,
+    548 MB track never finished processing at Yoto."""
+    long_book = ([{"start": 0, "title": "Opening"}, {"start": 60, "title": "Book"}], 19 * 3600)
+    books = [long_book] + [([{"start": i * 1200, "title": f"C{i}"} for i in range(30)], 36000)] * 4
+    plans = plan_whole(books, math.inf)
+    assert sum(len(p) for p in plans) <= 99
+    assert max(e - s for p in plans for s, e, _ in p) <= 2 * 3600
+
+
+def test_plan_whole_book_without_chapters():
+    [plan] = plan_whole([([], 2 * 3600)], 3300)
+    assert len(plan) == 4 and plan[-1][1] == 2 * 3600          # 30 min parts, as on a streaming card
+
+
+def test_plan_whole_covers_audio_no_chapter_covers():
+    # broken chapter data: a 20 h book listed as a 106 min chapter and an empty one
+    chapters = [{"start": 0, "end": 6360, "title": "Chapter 1"}, {"start": 6360, "end": 6360, "title": "Chapter 2"}]
+    [plan] = plan_whole([(chapters, 1248 * 60)], math.inf)
+    assert plan[0][0] == 0 and plan[-1][1] == 1248 * 60
+    assert max(e - s for s, e, _ in plan) <= 1800
+
+
+async def test_an_upload_yoto_never_finishes_is_uploaded_again(env):
+    br, client, _ = await env.make(offline_track_seconds=25, offline_whole_track_seconds=25)
+    br.yoto.TRANSCODE_TIMEOUT = 0.1
+    env.yoto.stuck.add("up1")                                      # the first upload's job never finishes
+    s = card(br)
+    await client.post(f"/api/cards/{s.slot}/offline", json={"mode": "book"})
+    info = await _wait_offline(client, s.slot)
+    assert info["status"] == "ready", info
+    shas = [c["tracks"][0]["trackUrl"] for c in env.yoto.posts[-1]["content"]["chapters"]]
+    assert shas[0] == "yoto:#sha-up2"                              # track 1 went up again
+    env.yoto.stuck.update({"up5", "up6", "up7"})                   # never finished, three times: fails
+    await client.post(f"/api/cards/{s.slot}/online")
+    await client.post(f"/api/cards/{s.slot}/offline", json={"mode": "book"})
+    info = await _wait_offline(client, s.slot)
+    assert info["status"] == "failed" and "3 tries" in info["error"], info
+
+
+async def test_audiobookshelf_away_mid_copy_waits_and_carries_on(env):
+    """ABS restarting (connection refused, 503) part-way through a copy: the copy waits and carries on with
+    the tracks it has, and no track is uploaded with silence where the audio should be."""
+    br, client, _ = await env.make(offline_track_seconds=25, offline_whole_track_seconds=25)
+    br.offline.RETRY_WAITS = (0.05,) * 3
+    s = card(br)
+    env.abs.down, env.abs.down_files = 1, 1  # the first session and the first audio request are refused
+    await client.post(f"/api/cards/{s.slot}/offline", json={"mode": "book"})
+    info = await _wait_offline(client, s.slot)
+    assert info["status"] == "ready", info
+    ups = list(env.yoto.uploads.values())
+    assert len(ups) == 3 and abs(tone_at(ups[0]) - 440) < 40 and abs(tone_at(ups[2]) - 1320) < 40
+    # away for longer than the copy waits: it fails, keeping what was uploaded for the next try
+    await client.post(f"/api/cards/{s.slot}/online")
+    env.abs.down = 1000
+    await client.post(f"/api/cards/{s.slot}/offline", json={"mode": "book"})
+    info = await _wait_offline(client, s.slot)
+    assert info["status"] == "failed" and "503" in info["error"], info
+    assert env.yoto.posts[-1]["content"]["chapters"][0]["tracks"][0]["type"] == "stream"
+
+
+async def test_whole_book_copy_one_chapter_per_track(env):
+    br, client, _ = await env.make(offline_track_seconds=25, offline_whole_track_seconds=25)
+    env.abs.progress["li1"] = {"currentTime": 45.0, "duration": 60.0}
+    s = card(br)
+    r = await client.post(f"/api/cards/{s.slot}/offline", json={"mode": "book"})
+    assert r.status == 200
+    info = await _wait_offline(client, s.slot)
+    assert info["status"] == "ready", info
+    assert (info["mode"], info["start"], info["end"], info["tracks"]) == ("book", 0, 60.0, 3)
+    chapters = env.yoto.posts[-1]["content"]["chapters"]
+    assert [c["title"] for c in chapters] == ["Chapter 1", "Chapter 2", "Chapter 3"]
+    ups = list(env.yoto.uploads.values())
+    assert abs(tone_at(ups[0]) - 440) < 40 and abs(tone_at(ups[2]) - 1320) < 40
+    # the player starts the new copy at track 1: ABS is not dragged back, and the player is moved on to
+    # where the book was left (45 s less the 5 s rewind = 40 s, the start of track 3)
+    br.on_yoto_event("dev-mini", {"cardId": "yc1", "chapterKey": "01", "position": 2, "playbackStatus": "playing"})
+    await asyncio.sleep(0.05)
+    assert env.abs.progress["li1"]["currentTime"] == 45.0
+    assert br.control.commands[-1] == ("play", "dev-mini", "yc1", 0) and br.control.tracks[-1] == 3
+    br.on_yoto_event("dev-mini", {"cardId": "yc1", "chapterKey": "01", "position": 3, "playbackStatus": "playing"})
+    await asyncio.sleep(0.05)
+    assert len([c for c in br.control.commands if c[0] == "play"]) == 1     # only once
+    # once there, positions sync as usual, going back included
+    br.on_yoto_event("dev-mini", {"cardId": "yc1", "chapterKey": "03", "position": 7, "playbackStatus": "paused"})
+    for _ in range(100):
+        if env.abs.progress["li1"]["currentTime"] == 47:
+            break
+        await asyncio.sleep(0.02)
+    assert env.abs.progress["li1"]["currentTime"] == 47
+    br.on_yoto_event("dev-mini", {"cardId": "yc1", "chapterKey": "01", "position": 5, "playbackStatus": "paused"})
+    for _ in range(100):
+        if env.abs.progress["li1"]["currentTime"] == 5:
+            break
+        await asyncio.sleep(0.02)
+    assert env.abs.progress["li1"]["currentTime"] == 5
+
+
+async def test_listening_while_the_copy_is_made_moves_the_resume_point(env):
+    """The card streams while the copy uploads; the place it got to then is where the copy resumes."""
+    br, client, _ = await env.make(offline_track_seconds=25, offline_whole_track_seconds=25)
+    env.abs.progress["li1"] = {"currentTime": 5.0, "duration": 60.0}
+    s = card(br)
+    real = br.yoto.upload_audio
+
+    async def upload(audio, name, **kw):
+        env.abs.progress["li1"] = {"currentTime": 50.0, "duration": 60.0}    # streamed on meanwhile
+        return await real(audio, name, **kw)
+    br.yoto.upload_audio = upload
+    await client.post(f"/api/cards/{s.slot}/offline", json={"mode": "book"})
+    assert (await _wait_offline(client, s.slot))["status"] == "ready"
+    assert br.store.get(s.slot).offline["resume"] == {"item_id": "li1", "pos": 45.0}
+    br.on_yoto_event("dev-mini", {"cardId": "yc1", "chapterKey": "01", "position": 1, "playbackStatus": "playing"})
+    await asyncio.sleep(0.05)
+    assert env.abs.progress["li1"]["currentTime"] == 50.0                 # not dragged back
+    assert br.control.commands[-1] == ("play", "dev-mini", "yc1", 5) and br.control.tracks[-1] == 3
+
+
+async def test_copy_cut_short_by_a_restart_carries_on(env):
+    br, client, _ = await env.make(offline_track_seconds=25, offline_whole_track_seconds=25)
+    s = card(br)
+    real, n = br.yoto.upload_audio, []
+
+    async def upload(audio, name, **kw):
+        n.append(name)
+        if len(n) == 2:
+            raise asyncio.CancelledError                 # the bridge stops during the second upload
+        return await real(audio, name, **kw)
+    br.yoto.upload_audio = upload
+    br.offline.start(s, None, None, "book")
+    with pytest.raises(asyncio.CancelledError):
+        await br.offline.tasks[s.slot]
+    off = br.store.get(s.slot).offline
+    assert off["status"] == "building" and len(off["uploads"]) == 1
+    assert not any(t["type"] == "audio" for p in env.yoto.posts for c in p["content"]["chapters"]
+                   for t in c["tracks"])                # the card was not touched: it still streams
+    br.yoto.upload_audio = real
+    br.offline.resume_interrupted()                      # as at start-up
+    info = await _wait_offline(client, s.slot)
+    assert info["status"] == "ready" and info["tracks"] == 3
+    assert len(env.yoto.uploads) == 3                    # track 1 was not uploaded again
+
+
+async def test_make_offline_again_can_redo_tracks_from_a_number(env):
+    """Tracks uploaded while ABS was going down (padded with silence by older bridges) are redone."""
+    br, client, _ = await env.make(offline_track_seconds=25, offline_whole_track_seconds=25)
+    s = card(br)
+    real, n = br.yoto.upload_audio, []
+
+    async def upload(audio, name, **kw):
+        n.append(name)
+        if len(n) == 3:
+            raise RuntimeError("Audiobookshelf went away")
+        return await real(audio, name, **kw)
+    br.yoto.upload_audio = upload
+    await client.post(f"/api/cards/{s.slot}/offline", json={"mode": "book"})
+    info = await _wait_offline(client, s.slot)
+    assert info["status"] == "failed" and len(br.store.get(s.slot).offline["uploads"]) == 2
+    br.yoto.upload_audio = real
+    before = len(env.yoto.uploads)
+    await client.post(f"/api/cards/{s.slot}/offline", json={"mode": "book", "redo_from": 2})
+    info = await _wait_offline(client, s.slot)
+    assert info["status"] == "ready" and info["tracks"] == 3
+    assert len(env.yoto.uploads) - before == 2          # track 1 reused, tracks 2 and 3 uploaded
+
+
+async def test_tracks_go_offline_one_by_one_while_the_rest_stream(env, monkeypatch):
+    import yotobridge.offline as off_mod
+    monkeypatch.setattr(off_mod, "LIVE_BATCH", 1)
+    br, client, _ = await env.make(offline_track_seconds=25, offline_whole_track_seconds=25)
+    s = card(br)
+    real, seen = br.yoto.upload_audio, []
+
+    async def upload(audio, name, **kw):
+        if len(seen) == 1:                               # track 2 uploading: what is on the card now?
+            off = br.store.get(s.slot).offline
+            seen.append([t["on_card"] for t in off["tracks"]])
+            url = env.yoto.posts[-1]["content"]["chapters"][2]["tracks"][0]["trackUrl"]
+            r = await client.get(url.replace("http://bridge.test:8080", ""))
+            seen.append(r.status == 200 and r.content_type == "audio/mpeg")   # track 3 streams from the bridge
+            # the player reports track 1 (on the card) and track 3 (streaming)
+            br.on_yoto_event("dev-mini", {"cardId": "yc1", "chapterKey": "01", "position": 6,
+                                          "playbackStatus": "paused"})
+        seen.append(name)
+        return await real(audio, name, **kw)
+    br.yoto.upload_audio = upload
+    await client.post(f"/api/cards/{s.slot}/offline", json={"mode": "book"})
+    assert (await _wait_offline(client, s.slot))["status"] == "ready"
+    kinds = [[t["tracks"][0]["type"] for t in p["content"]["chapters"]] for p in env.yoto.posts
+             if p["content"]["chapters"] and len(p["content"]["chapters"]) == 3]
+    # track 3 streaming from the bridge counts as the card playing, so the list after track 2 waits
+    assert kinds[-3:] == [["stream"] * 3, ["audio", "stream", "stream"], ["audio"] * 3]
+    assert seen[1] == [True, False, False] and seen[2] is True
+    assert env.abs.progress["li1"]["currentTime"] == 6                  # track 1 synced while uploading
+
+
+async def test_skipping_to_a_streamed_track_of_a_copy_being_made_plays_it(env):
+    # the book was left in track 1 (on the card); the listener skips to track 3, not uploaded yet
+    br, client, _ = await env.make(offline_track_seconds=25, offline_whole_track_seconds=25)
+    env.abs.progress["li1"] = {"currentTime": 6.0, "duration": 60.0}
+    s = card(br)
+    gate, real = asyncio.Event(), br.yoto.upload_audio
+
+    async def upload(audio, name, **kw):
+        await gate.wait()
+        return await real(audio, name, **kw)
+    br.yoto.upload_audio = upload
+    await client.post(f"/api/cards/{s.slot}/offline", json={"mode": "book"})
+    for _ in range(100):
+        if br.store.get(s.slot).offline.get("tracks") and env.yoto.posts and \
+                env.yoto.posts[-1]["content"]["chapters"][-1]["tracks"][0]["type"] == "stream":
+            break
+        await asyncio.sleep(0.02)
+    url = env.yoto.posts[-1]["content"]["chapters"][2]["tracks"][0]["trackUrl"].replace("http://bridge.test:8080", "")
+    n = len(br.control.commands)
+    assert (await client.head(url)).status == 200
+    r = await client.get(url)
+    assert r.status == 200 and len(await r.read()) == 20 * br.cfg.byterate     # chapter 3, not silence
+    assert not any(c[0] == "play" for c in br.control.commands[n:])             # no move back to track 1
+    gate.set()
+    assert (await _wait_offline(client, s.slot))["status"] == "ready"
+
+
+async def test_no_track_list_change_while_the_card_plays(env, monkeypatch):
+    import yotobridge.offline as off_mod
+    monkeypatch.setattr(off_mod, "LIVE_BATCH", 1)
+    br, client, _ = await env.make(offline_track_seconds=25, offline_whole_track_seconds=25)
+    s = card(br)
+    br.pm.devices["dev-mini"] = {"cardId": "yc1", "playbackStatus": "playing", "at": time.time()}
+    n = len(env.yoto.posts)
+    await client.post(f"/api/cards/{s.slot}/offline", json={"mode": "book"})
+    assert (await _wait_offline(client, s.slot))["status"] == "ready"
+    assert len(env.yoto.posts) == n + 1                                  # only the finished copy
+
+
+async def test_whole_series_copy_is_the_whole_series_wherever_the_listener_is(env):
+    br, client, _ = await env.make(offline_track_seconds=25, offline_whole_track_seconds=25)
+    env.abs.progress["li1"] = {"currentTime": 60.0, "duration": 60.0, "isFinished": True, "lastUpdate": 1000}
+    env.abs.progress["li2"] = {"currentTime": 30.0, "duration": 60.0, "lastUpdate": 2000}
+    slot = await _series_card(client)
+    r = await client.post(f"/api/cards/{slot}/offline", json={"mode": "series"})
+    assert r.status == 200
+    info = await _wait_offline(client, slot)
+    assert info["status"] == "ready", info
+    assert (info["from_title"], info["to_title"], info["tracks"]) == ("Book li1", "Book li3", 9)
+    off = br.store.get(slot).offline
+    assert [t["item_id"] for t in off["tracks"]] == ["li1"] * 3 + ["li2"] * 3 + ["li3"] * 3
+    assert off["tracks"][0]["start"] == 0 and off["books_left_off"] == 0
+    assert off["resume"]["item_id"] == "li2"            # the player is still moved to where book 2 was left
+    assert br.offline._resume_target(off)[0] == 5       # book 2, chapter 2
+    assert env.yoto.posts[-1]["content"]["chapters"][6]["title"] == "Book li3: Chapter 1"
+
+
+async def test_progress_reset_while_a_series_copy_is_made_moves_the_start_back(env):
+    """Seen on a real card: test skips left book 2 half-listened; it was reset in ABS during the upload."""
+    br, client, _ = await env.make(offline_track_seconds=25, offline_whole_track_seconds=25)
+    env.abs.progress["li2"] = {"currentTime": 30.0, "duration": 60.0, "lastUpdate": 2000}
+    slot = await _series_card(client)
+    gate, real = asyncio.Event(), br.yoto.upload_audio
+
+    async def upload(audio, name, **kw):
+        await gate.wait()
+        return await real(audio, name, **kw)
+    br.yoto.upload_audio = upload
+    await client.post(f"/api/cards/{slot}/offline", json={"mode": "series"})
+    for _ in range(100):
+        if br.store.get(slot).offline.get("resume"):
+            break
+        await asyncio.sleep(0.02)
+    assert br.store.get(slot).offline["resume"]["item_id"] == "li2"
+    env.abs.progress.pop("li2")                                       # reset in ABS
+    env.abs.progress["li1"] = {"currentTime": 12.0, "duration": 60.0, "lastUpdate": 3000}
+    gate.set()
+    assert (await _wait_offline(client, slot))["status"] == "ready"
+    s = br.store.get(slot)
+    assert s.offline["resume"] == {"item_id": "li1", "pos": 7.0} and s.item_id == "li1"
+
+
+async def test_whole_series_too_long_from_book_one_starts_at_the_current_book(env, monkeypatch):
+    import yotobridge.offline as off_mod
+    br, client, _ = await env.make(offline_track_seconds=25, offline_whole_track_seconds=25)
+    env.abs.progress["li1"] = {"currentTime": 60.0, "duration": 60.0, "isFinished": True, "lastUpdate": 1000}
+    env.abs.progress["li2"] = {"currentTime": 60.0, "duration": 60.0, "isFinished": True, "lastUpdate": 1500}
+    env.abs.progress["li3"] = {"currentTime": 30.0, "duration": 60.0, "lastUpdate": 2000}
+    monkeypatch.setattr(off_mod, "WHOLE_TRACKS", 4)     # books 1 and 2 would crowd out book 3
+    slot = await _series_card(client)
+    await client.post(f"/api/cards/{slot}/offline", json={"mode": "series"})
+    info = await _wait_offline(client, slot)
+    assert (info["status"], info["from_title"], info["to_title"]) == ("ready", "Book li3", "Book li3"), info
+
+
+async def test_whole_series_needs_a_series_card(env):
+    br, client, _ = await env.make()
+    s = card(br)
+    assert (await client.post(f"/api/cards/{s.slot}/offline", json={"mode": "series"})).status == 409
+    assert (await client.post(f"/api/cards/{s.slot}/offline", json={"mode": "bogus"})).status == 409
+
+
+async def test_whole_series_leaves_off_books_that_do_not_fit(env, monkeypatch):
+    import yotobridge.offline as off_mod
+    br, client, _ = await env.make(offline_track_seconds=25, offline_whole_track_seconds=25)
+    slot = await _series_card(client)
+    # no size limit by default: tracks are the limit. 3 chapters a book need 3 tracks; room for 7
+    monkeypatch.setattr(off_mod, "WHOLE_TRACKS", 7)
+    await client.post(f"/api/cards/{slot}/offline", json={"mode": "series"})
+    info = await _wait_offline(client, slot)
+    assert info["status"] == "ready", info
+    assert (info["from_title"], info["to_title"], info["books_left_off"]) == ("Book li1", "Book li2", 1)
+    # with offline_max_mb set, books over it are left off too, and a book over it fails
+    monkeypatch.setattr(off_mod, "WHOLE_TRACKS", 99)
+    br.cfg.offline_max_mb = 1                        # 125 s of audio at 64 kbps
+    await client.post(f"/api/cards/{slot}/online")
+    await client.post(f"/api/cards/{slot}/offline", json={"mode": "series"})
+    info = await _wait_offline(client, slot)
+    assert (info["status"], info["to_title"], info["books_left_off"]) == ("ready", "Book li2", 1)
+    br.cfg.offline_max_mb = 0.0001
+    await client.post(f"/api/cards/{slot}/online")
+    await client.post(f"/api/cards/{slot}/offline", json={"mode": "book"})
+    info = await _wait_offline(client, slot)
+    assert info["status"] == "failed" and "offline_max_mb" in info["error"]
 
 
 # ---------------------------------------------------------------- series cards
@@ -1211,6 +1569,49 @@ async def test_retap_after_pulling_the_card_resumes_instead_of_restarting_the_ch
     br.pm.on_event("dev-mini", {"cardId": "none", "playbackStatus": "stopped"})   # card out
     r, _ = await _get(client, f"/s/{slot}/{lid}/2.mp3")                    # back in: same track
     assert br.pm.by_slot[slot].base == 28.0                                # 33 - 5 rewind, not the chapter start
+
+
+async def test_resume_after_a_pause_carries_on_inside_the_track(env):
+    """Seen on a real Yoto: a pause hangs up the stream; resume asks for the same track afresh (no Range)."""
+    br, client, _ = await env.make(chapter_tracks=True)
+    slot = await _chapter_card(env, client, progress=25.0)
+    lid = br.store.get(slot).layout_id
+    card_id = br.store.get(slot).yoto_card_id
+    await _get(client, f"/s/{slot}/{lid}/2.mp3")
+    br.pm.position = lambda _pb: 31.0
+    br.pm.on_event("dev-mini", {"cardId": card_id, "playbackStatus": "paused"})
+    br.pm.on_event("dev-mini", {"cardId": card_id, "playbackStatus": "playing"})
+    r, _ = await _get(client, f"/s/{slot}/{lid}/2.mp3")
+    # a short pause backs up 2 s
+    assert br.pm.by_slot[slot].base == 29.0 and int(r.headers["Content-Length"]) == 11 * BYTERATE
+    # a pause over 30 s backs up rewind_seconds (5 s)
+    br.pm.on_event("dev-mini", {"cardId": card_id, "playbackStatus": "paused"})
+    br.pm.by_slot[slot].paused_at -= 45
+    br.pm.on_event("dev-mini", {"cardId": card_id, "playbackStatus": "playing"})
+    r, _ = await _get(client, f"/s/{slot}/{lid}/2.mp3")
+    assert br.pm.by_slot[slot].base == 26.0 and int(r.headers["Content-Length"]) == 14 * BYTERATE
+    # resumed before the player reports "playing": the pause so far counts
+    br.pm.on_event("dev-mini", {"cardId": card_id, "playbackStatus": "paused"})
+    r, _ = await _get(client, f"/s/{slot}/{lid}/2.mp3")
+    assert br.pm.by_slot[slot].base == 29.0
+
+
+async def test_card_out_and_back_in_resumes_where_it_was_taken_out(env):
+    """Seen on a real Yoto: card out ("stopped", no card), back in; the player reports "playing" about
+    5 s before it asks for the audio, and that wait is not listening."""
+    br, client, _ = await env.make(chapter_tracks=True)
+    slot = await _chapter_card(env, client, progress=25.0)
+    lid = br.store.get(slot).layout_id
+    card_id = br.store.get(slot).yoto_card_id
+    await _get(client, f"/s/{slot}/{lid}/2.mp3")
+    clock = {"pos": 31.0}
+    br.pm.position = lambda _pb: clock["pos"]
+    br.pm.on_event("dev-mini", {"cardId": card_id, "playbackStatus": "playing"})
+    br.pm.on_event("dev-mini", {"cardId": "none", "playbackStatus": "stopped"})       # card out at 31 s
+    br.pm.on_event("dev-mini", {"cardId": card_id, "playbackStatus": "playing"})       # back in
+    clock["pos"] = 36.0                                                                # 5 s waiting for audio
+    r, _ = await _get(client, f"/s/{slot}/{lid}/2.mp3")
+    assert br.pm.by_slot[slot].base == 29.0                                            # 31 s, 2 s back
 
 
 async def test_tap_on_another_track_than_the_listeners_moves_the_player(env):

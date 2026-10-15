@@ -35,6 +35,8 @@ from .streamer import Track
 
 log = logging.getLogger(__name__)
 now = time.monotonic
+SHORT_PAUSE = 30.0          # a pause shorter than this backs up SHORT_PAUSE_REWIND on resume, a longer one rewind_seconds
+SHORT_PAUSE_REWIND = 2.0
 
 STARTUP_LAG_SECONDS = 3.0            # from the request for audio to the player playing it (see position())
 
@@ -97,6 +99,8 @@ class Playback:
     speed: float = 1.0               # playback speed this stream is encoded at
     paused_at: float | None = None   # since when the player reports this stream paused or stopped
     paused_total: float = 0.0        # seconds it spent paused since the stream started
+    last_pause: float = 0.0          # how long the latest pause lasted (to back up a little on resume)
+    pause_pos: float | None = None   # where it was when the player last paused or stopped (card out)
 
 
 class PlaybackManager:
@@ -204,7 +208,7 @@ class PlaybackManager:
                 pb.main_started = now()
                 pb.main_bytes = 0
                 pb.event_offset = None
-                pb.paused_at, pb.paused_total = None, 0.0
+                pb.paused_at, pb.paused_total, pb.pause_pos = None, 0.0, None
             return pb, start
 
     async def open_track(self, slot: Slot, range_start: int, client_ip: str | None, req: dict) -> tuple[Playback, float]:
@@ -235,7 +239,7 @@ class PlaybackManager:
                 pb.main_started = now()
                 pb.main_bytes = 0
                 pb.event_offset = None
-                pb.paused_at, pb.paused_total = None, 0.0
+                pb.paused_at, pb.paused_total, pb.pause_pos = None, 0.0, None
             return pb, start
 
     async def _begin_track(self, slot: Slot, client_ip: str | None, req: dict) -> Playback:
@@ -482,10 +486,14 @@ class PlaybackManager:
                      device_id, now() - pb.main_started)
         status = ev.get("playbackStatus")
         if status in ("paused", "stopped") and pb.paused_at is None:
+            pb.pause_pos = self.position(pb)
             pb.paused_at = now()
         elif status == "playing" and pb.paused_at is not None:
             pb.paused_total += now() - max(pb.paused_at, pb.main_started)
+            pb.last_pause = now() - pb.paused_at
             pb.paused_at = None
+            if pb.open_streams:
+                pb.pause_pos = None      # carried on from the stream still open: no fresh request to place
         pb.event = dict(merged)
         pb.event_at = now()
         if "position" in ev and pb.event_offset is None and self.cfg.position_mode == "relative":
@@ -578,6 +586,12 @@ class PlaybackManager:
         asyncio.get_running_loop().create_task(run())
 
     # ---------------- position ----------------
+
+    def pause_rewind(self, pb: Playback) -> float:
+        """Seconds to back up when a paused stream resumes: a little after a short pause, the usual
+        rewind_seconds after one over SHORT_PAUSE (enough to pick the thread up again)."""
+        pause = now() - pb.paused_at if pb.paused_at is not None else pb.last_pause
+        return SHORT_PAUSE_REWIND if pause < SHORT_PAUSE else float(self.cfg.rewind_seconds)
 
     def position(self, pb: Playback) -> float:
         # The Yoto downloads well ahead (seen: ~12 min of audio in 9 s) and closes the connection, then

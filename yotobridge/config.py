@@ -72,6 +72,8 @@ class Config:
     chapter_icons: bool = True        # cover + chapter number on the Yoto's pixel display
     offline_hours: float = 5          # how much of the book "Make offline" copies (Yoto allows 5 h per card)
     offline_track_seconds: int = 3300  # longest uploaded track (Yoto allows 60 min); chapters are split to fit
+    offline_whole_track_seconds: int = 0  # whole-book/series copies: longest track in seconds (0 = no limit)
+    offline_max_mb: int = 0            # whole-book/series copies: total size limit in MB (0 = none)
     end_grace_seconds: int = 45       # wait this long after the stream closes before closing the ABS session
     identify_wait_seconds: float = 2  # per-player ABS users: how long a card tap waits for the player's event
 
@@ -87,6 +89,10 @@ class Config:
     # only if that user may edit books.
     audible_region: str = "us"
     chapters_api_key: str = ""
+
+    # AI chapter pictures (see README "AI chapter pictures"): transcribe / text / image services in the
+    # OpenAI API format, e.g. {transcribe: {url, model, key}, text: {...}, image: {..., api: ollama}}. Empty = off.
+    ai_pictures: dict = field(default_factory=dict)
 
     library_ids: list[str] = field(default_factory=list)  # empty = all book libraries the ABS user can see
     ui_pin: str = ""                  # optional PIN for the web page's card-admin actions
@@ -142,8 +148,11 @@ def load(path: str | None = None) -> Config:
     if unknown:
         raise SystemExit(f"Unknown config keys: {', '.join(sorted(unknown))}")
     cfg = Config(**raw, devices=devices)
+    from .ai_pictures import AISettings
+    AISettings.parse(cfg.ai_pictures)          # stop at start-up on a mistyped key
     for name in ("listen_port", "bitrate_kbps", "channels", "sample_rate", "rewind_seconds",
                  "player_buffer_seconds", "sync_interval", "end_grace_seconds", "offline_track_seconds",
+                 "offline_whole_track_seconds", "offline_max_mb",
                  "alert_after_failures", "warm_start_seconds", "warm_refresh_seconds", "part_seconds"):
         setattr(cfg, name, int(getattr(cfg, name)))
     cfg.identify_wait_seconds = float(cfg.identify_wait_seconds)

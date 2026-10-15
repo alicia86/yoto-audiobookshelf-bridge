@@ -98,6 +98,40 @@ The phone page is at `http://<host-ip>:8090` on your network.
 
 The Yoto's pixel display shows a 16x16 icon per track. The bridge draws one from the book's cover (shrunk to 16x16) with the current chapter number in tiny 3x4 digits in the top-right corner, tinted into the cover (light on dark covers, dark on light ones); books without chapters get just the mini cover. `chapter_icons: false` turns this off.
 
+That is the default style. **Cards → Pixel icons on cards** sets another default, and each card's **Icon** button gives that card its own style (the card's style wins, like speed), with a preview of each:
+
+| Style | What the display shows |
+|---|---|
+| Cover, number top right / top left / bottom left / bottom right | the cover with the tiny chapter number in that corner |
+| Big number on a dimmed cover | the cover at 40% with the number in doubled 3x5 digits |
+| Cover only | just the cover |
+| Number only | the number, big, on a plain colour taken from the cover |
+| Cover with a progress bar | the cover with a bar along the bottom row: how far into the book the chapter starts |
+| Chapter theme icons | an icon from Yoto's public icon library whose title or tags match words of the chapter title; chapters like "Chapter 7" fall back to the default style. Kid-safe only unless **Theme icons → Allow every icon**: icons naming weapons, gore and the like are never picked |
+| Random pixel creatures | a mirrored 8x8 creature in the cover's colours, different per chapter, always the same for that chapter |
+| Custom picture | a picture you upload for that card, shrunk to 16x16; **Pictures per chapter** gives single chapters of the current book a picture of their own (chapters without one show the card's picture, or the default style) |
+| No icon | the Yoto's own default icon |
+
+A style change rewrites the card's Yoto playlist with new icon URLs (so the player fetches new icons); a card that is playing gets them when it stops, and an offline copy on its next copy. Theme icons on offline copies use Yoto's own icon (nothing uploaded).
+
+### AI chapter pictures
+
+**Pictures per chapter → Make AI pictures** listens to the start of each chapter of the card's book (the first `sample_seconds`, 3 minutes by default) and makes it a picture, saved as that chapter's own picture (so it can still be changed by hand). Chapters that already have a picture are kept unless you press **Redo all**. It runs in the background, one chapter at a time; when a service cannot be reached (a computer asleep) the chapter waits up to `retry_minutes` (60) and is tried again.
+
+The bridge does none of the AI itself. It calls three services in the OpenAI API format, set under `ai_pictures` in config.yaml (see `config.example.yaml`); each has its own `url` (ending in `/v1`), `model` and optional `key`, so they can run on a computer at home, at any hosted provider, or a mix:
+
+| Step | Request | Runs on, for example |
+|---|---|---|
+| `transcribe` | `POST <url>/audio/transcriptions` (16 kHz WAV) | whisper.cpp's `whisper-server --inference-path /v1/audio/transcriptions`, OpenAI, Groq |
+| `text` | `POST <url>/chat/completions` | Ollama, LM Studio, OpenAI, OpenRouter |
+| `image` (optional) | `POST <url>/images/generations`, or with `api: ollama` Ollama's `POST <url>/api/generate` | LocalAI, OpenAI; Ollama's image models (macOS) |
+
+- **Without `image`**: the text model names a few things the chapter is about, and picks the best of the matching icons from Yoto's own icon library (drawn for 16x16; the theme icons' kid-safe filter applies). Small: a 3B text model and a small Whisper model fit next to everything else on a 16 GB computer.
+- **With `image`**: the text model describes one simple object, which is drawn as a flat pixel-art icon and shrunk to 16x16. Image models need a lot of memory; on 16 GB set `unload: true` on every Ollama step so each model leaves memory after its step.
+- Kid-safe: the text model is told to keep to kid-safe things, and a subject naming a weapon or anything gory is dropped (the chapter is left as it was), unless **Theme icons → Allow every icon**.
+- What leaves the bridge: up to `sample_seconds` of each chapter's audio goes to the transcribe service, and its text to the text service. Keep both at home if that matters to you.
+
+
 - **Streaming cards** point their track at `<public_url>/s/icon/<slot>.png` (Yoto "dynamic icons", `display.iconUrl16x16`), which the bridge draws on request for the chapter being listened to, or the chapter ABS has the book at when the card is idle. Existing cards get the icon on the next bridge start. Whether the player re-fetches the icon while a track plays (so the number moves on mid-stream) is not documented; see [Unverified points](#unverified-points-and-what-each-test-result-changes).
 - **Offline copies** upload one icon per chapter (`display.icon16x16`), so each chapter track shows its number with no internet. This needs the **`user:icons:manage`** scope on your Yoto app (dashboard.yoto.dev → your app → Scopes), then **Connect Yoto** again on the bridge page so the new permission is granted. Without it, offline copies are made as before, just without icons, and the log says why. Icons are uploaded once per book chapter and reused.
 
@@ -157,7 +191,17 @@ A streaming card needs the internet on every tap. For a trip, open **Cards** on 
 4. Whenever the player is online and playing the copy, the position it reports (chapter + position within it) is written to ABS. It never moves ABS backwards past a point the phone has reached since.
 5. Back home, press **Back to streaming**: the stream track goes back on the card and the next tap resumes from ABS.
 
-Limits: Yoto allows 100 tracks, 60 minutes per track and 5 hours per card, so a copy covers up to 5 hours from where you are, not the whole of a long book. The audio is uploaded to your Yoto account (only for books you make offline). Listening done while the player is offline only reaches ABS when the player next reports its position online.
+**What to copy.** The sheet offers three choices:
+
+- **Next 5 hours** (as above).
+- **Whole book**: the whole book from its start, one chapter per track, so track N is chapter N as on a streaming card. Chapters are not split, except a "chapter" over an hour (below); a book with more than 99 chapters has neighbouring chapters share a track.
+- **Whole series** (series and collection cards): every book from book 1 to the end of the series, wherever the listener is (the player is still moved to where they left off). If that is too much for 99 tracks (or for `offline_max_mb`), it starts at the current book instead. Each track holds as many whole chapters as it takes to fit everything in 99 tracks, and no track spans two books.
+
+While a copy is being made, the card gets the copy's track list at once: tracks not uploaded yet stream from the bridge, and finished ones switch to their uploaded audio every 5 tracks or 2 minutes (never while the card is playing, so the player is not cut off). The card row shows "12 of 56 tracks on the card, the rest stream". Tracks on the card play offline once the player has downloaded them; until the copy says ready, the card still needs the bridge for the rest. Streamed tracks play at the card's speed, not the copy's. If the bridge restarts mid-upload (a deploy), it carries on at start-up, reusing the tracks already uploaded; pressing Make offline again after a failed copy reuses them too. If the card was listened to while the copy was made, the copy resumes from where that listening got to.
+
+A whole copy starts at the top, so on its first play while online the bridge moves the player to where the book was left, and nothing is written to ABS until the player has got there (a copy starting at track 1 never drags ABS back). Whole copies keep each track under about 1 h 55 min of audio (Yoto's API never finished processing longer ones: 96 to 119 minute tracks were done in a minute or two, a 122 minute one never), so chapters are not split, with one exception, the same as on a streaming card: a book without chapters, or a "chapter" longer than an hour (a book listed as one or two huge chapters), goes in 30-minute parts (`part_seconds`), so no single track is a whole long book. To keep to Yoto's stated 60 minutes per track (in case its API enforces it), set `offline_whole_track_seconds: 3300`; then long chapters are split and 99 tracks hold about 90 hours of book at 1×. A series that does not fit takes as many whole books as fit and the card row says how many were left off; a single book that does not fit fails with a message, and the card keeps streaming.
+
+Limits: Yoto's guide says 100 tracks, 60 minutes or 100 MB per track and 5 hours or 500 MB per card. The per-card total and the 60 minutes per track are not hard limits in practice (whole multi-book series fit on one card, with longer tracks), so Next 5 hours keeps to its 5 hours and 55-minute tracks but whole copies have no total limit and keep tracks under 2 hours; set `offline_max_mb` and `offline_whole_track_seconds` to add them. If Yoto refuses an upload, the copy fails and the card keeps streaming; an upload Yoto has not finished processing after 15 minutes is sent again, up to 3 times. If ABS or the network goes away part-way (a restart, a NAS update), the copy waits and carries on, for about an hour in all, and a track ABS stopped sending part-way is made again rather than uploaded with a gap. If a copy does fail, press Make offline with the same choice again: the tracks already uploaded are reused. The audio is uploaded to your Yoto account (only for books you make offline). Listening done while the player is offline only reaches ABS when the player next reports its position online.
 
 ### A child's own ABS user, and one per child
 
@@ -226,6 +270,7 @@ Things only a real player can answer that have not been confirmed yet. Each maps
 |---|---|---|
 | The player caches stream tracks offline | Play a card, unplug the bridge's network, tap again. | Server-side resume assumes the player re-requests the URL each time. If it plays from a cache, resume falls back to the Yoto's own position for that session and the next online play re-syncs. For car trips, use [offline copies](#offline-copies-car-trips-flights). |
 | MQTT `position` for a stream: counted from where this stream started, or from the start of the book | With `LOG_LEVEL=DEBUG`, compare the event positions to the bridge's `start … at Ns` line. | Set `event_position: absolute`. Either way the cap on delivered audio keeps a wrong guess from jumping ahead. |
+| Pause and resume on a streamed chapter track | Play a minute, pause for 10 s, resume; then pause for a minute and resume. The log shows `resuming track N at Ss (2s back)`, then `(5s back)`. | A Yoto hangs up the stream on pause and asks for the track afresh on resume; if it ever sends a Range header instead, the resume is served from that byte and these lines do not appear. |
 | Offline copies: MQTT `position` is within the current track, and `chapterKey` is the uploaded chapter's key | Make a card offline, play it a minute into track 2, pause. The log shows `offline copy of … : wrote Ns to ABS`; N should be track 2's start plus about a minute. | If positions turn out to be counted from the start of the playlist, the mapping in `offline.py` (`on_event`) changes to use them directly. |
 
 

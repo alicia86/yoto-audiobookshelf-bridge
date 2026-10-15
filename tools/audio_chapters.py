@@ -2,7 +2,7 @@
 """Find a book's chapters in its own audio, for books Audible has no useful chapters for (dramatized
 editions listed as a few long parts, home recordings, ...). Run it on a fast computer, not a low-power server:
 
-    python3 tools/audio_chapters.py --search "Alcatraz"              # list matching books and their ids
+    python3 tools/audio_chapters.py --search "Treasure Island"           # list matching books and their ids
     python3 tools/audio_chapters.py li_abc123 li_def456               # find chapters, send them to the bridge
 
 Two signals are combined:

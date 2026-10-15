@@ -34,6 +34,9 @@ class Slot:
     layouts: dict = field(default_factory=dict)  # layout id -> list of segments (see chapters.py); last few kept
     offline: dict = field(default_factory=dict)  # offline copy on this card (see offline.py); empty = streaming
     speed: float = 0.0             # playback speed for this card; 0 = the player's speed
+    icon_style: str = ""           # pixel icon style for this card (icons.STYLES); "" = the default style
+    icon_custom: str = ""          # hash of this card's own picture (custom style), kept in <data_dir>/icons/
+    icon_chapters: dict = field(default_factory=dict)  # "<item>:<chapter>" -> hash of that chapter's own picture
 
 
 @dataclass
@@ -41,6 +44,8 @@ class State:
     slots: dict[str, Slot] = field(default_factory=dict)
     icons: dict[str, str] = field(default_factory=dict)   # "<item>:<chapter>" -> uploaded Yoto icon ("yoto:#…")
     speeds: dict[str, float] = field(default_factory=dict)  # Yoto deviceId -> playback speed (absent = 1.0)
+    icon_style: str = ""           # default pixel icon style of every card ("" = icons.DEFAULT_STYLE)
+    icon_allow_all: bool = False   # chapter theme icons: also pick weapons and other not-for-kids icons
 
 
 class Store:
@@ -52,10 +57,13 @@ class Store:
             self.state.slots = {k: Slot(**v) for k, v in raw.get("slots", {}).items()}
             self.state.icons = raw.get("icons", {})
             self.state.speeds = raw.get("speeds", {})
+            self.state.icon_style = raw.get("icon_style", "")
+            self.state.icon_allow_all = bool(raw.get("icon_allow_all", False))
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        data = {"slots": {k: asdict(v) for k, v in self.state.slots.items()}, "icons": self.state.icons, "speeds": self.state.speeds}
+        data = {"slots": {k: asdict(v) for k, v in self.state.slots.items()}, "icons": self.state.icons, "speeds": self.state.speeds,
+                "icon_style": self.state.icon_style, "icon_allow_all": self.state.icon_allow_all}
         fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".state")
         with os.fdopen(fd, "w") as f:
             json.dump(data, f, indent=2)
