@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from .abs_client import ABSClient, ABSError
 from .config import Config
 from .series import current_index, group_books
+from .localprogress import LocalKey
 from .store import Slot, Store
 from .streamer import Track
 
@@ -122,6 +123,12 @@ class PlaybackManager:
         self.known_devices = lambda: []  # the account's Yoto player ids (set by the Bridge)
 
     # ---------------- playback speed ----------------
+
+    def key_for(self, slot: Slot | None, device_id: str | None = None) -> str:
+        """The ABS key a card's calls use: the player's key, or for a card that keeps its own place a
+        LocalKey, so its progress stays on the bridge (localprogress.py)."""
+        key = self.cfg.abs_key_for(device_id)
+        return LocalKey(key, slot.slot) if slot is not None and slot.own_place else key
 
     def speed_for(self, slot: Slot | None, device_id: str = "") -> float:
         """The card's own speed if it has one, else the player's; 1.0 if neither is set. With the
@@ -244,7 +251,7 @@ class PlaybackManager:
 
     async def _begin_track(self, slot: Slot, client_ip: str | None, req: dict) -> Playback:
         device_id, sure = await self._identify(slot, client_ip)
-        key = self.cfg.abs_key_for(device_id)
+        key = self.key_for(slot, device_id)
         name = (self.cfg.devices.get(device_id).name if device_id in self.cfg.devices else "") or "Yoto"
         sess = await self.abs.play(req["item_id"], f"yoto-{device_id or slot.slot}", name, key)
         tracks = self._tracks(sess.get("audioTracks", []))
@@ -279,7 +286,7 @@ class PlaybackManager:
 
     async def _begin(self, slot: Slot, client_ip: str | None) -> Playback:
         device_id, sure = await self._identify(slot, client_ip)
-        key = self.cfg.abs_key_for(device_id)
+        key = self.key_for(slot, device_id)
         name = (self.cfg.devices.get(device_id).name if device_id in self.cfg.devices else "") or "Yoto"
         following = []
         if slot.series_id:
@@ -332,7 +339,7 @@ class PlaybackManager:
         if (not secs or not self.encoder or slot.offline or not slot.item_id or slot.slot in self.by_slot
                 or self.cfg.resume_mode != "server"):
             return
-        key = self.cfg.abs_key_for(slot.device_id)
+        key = self.key_for(slot, slot.device_id)
         prog = await self.abs.progress(slot.item_id, key) or {}
         tracks = self._tracks(await self.abs.item_tracks(slot.item_id, key))
         duration = (tracks[-1].start + tracks[-1].duration) if tracks else 0.0
@@ -474,7 +481,7 @@ class PlaybackManager:
             # could be another child's shop card on the other player.
             pb.device_sure = True
             pb.device_id = device_id
-            if self.cfg.abs_key_for(device_id) != pb.abs_key or self.speed_for(slot, device_id) != pb.speed:
+            if self.key_for(slot, device_id) != pb.abs_key or self.speed_for(slot, device_id) != pb.speed:
                 self._restart_as(pb, device_id, merged["cardId"])
                 return
         pb.device_id = pb.device_id or device_id

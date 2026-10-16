@@ -37,6 +37,7 @@ class Slot:
     icon_style: str = ""           # pixel icon style for this card (icons.STYLES); "" = the default style
     icon_custom: str = ""          # hash of this card's own picture (custom style), kept in <data_dir>/icons/
     icon_chapters: dict = field(default_factory=dict)  # "<item>:<chapter>" -> hash of that chapter's own picture
+    own_place: bool = False        # keeps its own place: listening is never written to ABS (localprogress.py)
 
 
 @dataclass

@@ -26,6 +26,9 @@ from .offline import OfflineManager
 from .series import CollectionIndex, _series_entries, group_books
 from .config import Config
 from .playback import PlaybackManager
+from .quiet import WINDOW as QUIET_WINDOW, QuietSpots
+from .localprogress import LocalProgress
+from .sources import Sources
 from .store import Store
 from .streamer import Encoder
 from .yoto import YotoAPI, YotoAuth, YotoControl, YotoLoginError, YotoNotLoggedIn
@@ -42,8 +45,9 @@ class Bridge:
         self.cfg = cfg
         self.http = http
         self.store = Store(cfg.data_dir)
-        self.abs = ABSClient(http, cfg.abs_url, cfg.abs_api_key)
+        self.abs = Sources(ABSClient(http, cfg.abs_url, cfg.abs_api_key), LocalProgress(cfg.data_dir))
         self.encoder = Encoder(cfg.bitrate_kbps, cfg.channels, cfg.sample_rate)
+        self.quiet = QuietSpots(cfg.data_dir)
         self.auth = YotoAuth(http, cfg.yoto_client_id, cfg.yoto_login, cfg.yoto_api,
                              Path(cfg.data_dir) / "yoto_tokens.json",
                              redirect_uri=cfg.yoto_redirect_uri or f"{cfg.public_url}{CALLBACK_PATH}")
@@ -164,8 +168,47 @@ class Bridge:
 
     # ---------------- chapters as tracks ----------------
 
+    def snapper(self, item_id: str):
+        """Where a book's cuts inside chapters move to, from the pauses already found (quiet.py)."""
+        return self.quiet.snapper(item_id) if self.cfg.snap_cuts else None
+
+    async def snap_for(self, item_id: str, key, plan, budget: float | None = None):
+        """Find the pauses near the cuts plan(snap) makes inside chapters, if not found before, and
+        return the snapper for the book. plan is run once with a snap that only notes the cuts. With a
+        budget (seconds), the cuts not looked at in time keep their planned place until the next call."""
+        if not self.cfg.snap_cuts:
+            return None
+        planned: list[float] = []
+        plan(lambda t: (planned.append(t), t)[1])
+        todo = self.quiet.missing(item_id, planned)
+        if todo:
+            tracks = self.pm._tracks(await self.abs.item_tracks(item_id, key))
+            auth = self.abs.auth_header(key)
+            end = (tracks[-1].start + tracks[-1].duration) if tracks else 0.0
+            t0, gate, found = time.monotonic(), asyncio.Semaphore(4), []
+
+            async def look(t: float):
+                async with gate:
+                    if budget is not None and time.monotonic() - t0 > budget:
+                        return
+                    try:
+                        spots = await asyncio.wait_for(self.encoder.quiet_spots(
+                            tracks, max(0.0, t - QUIET_WINDOW), min(end, t + QUIET_WINDOW), auth), 60)
+                    except Exception as e:       # not this time: the planned cut stands, tried again next time
+                        log.warning("could not look for a pause near %.0fs of %s: %s", t, item_id,
+                                    e or type(e).__name__)
+                        return
+                    self.quiet.add(item_id, (t - QUIET_WINDOW, t + QUIET_WINDOW), spots)
+                    found.append(t)
+
+            await asyncio.gather(*(look(t) for t in todo))
+            self.quiet.save()
+            log.info("looked for pauses near %d of %d cuts inside chapters of %s in %.0fs", len(found), len(todo),
+                     item_id, time.monotonic() - t0)
+        return self.snapper(item_id)
+
     async def build_layout(self, slot) -> list:
-        key = self.cfg.abs_key_for(slot.device_id)
+        key = self.pm.key_for(slot, slot.device_id)
         following = await self.pm.resolve_series(slot, key) if slot.series_id else []
         prog = await self.abs.progress(slot.item_id, key) or {}
         duration, chapters = await self.book_info(slot.item_id)
@@ -176,7 +219,15 @@ class Bridge:
         for b in following[:20]:
             d, ch = await self.book_info(b.item_id)
             books.append((b.item_id, b.title, d or b.duration, ch, 0.0))
-        return chapter_tracks.make_layout(books, self.cfg.part_seconds)
+        part, snaps = self.cfg.part_seconds, {}
+        seen = 0
+        for item_id, _t, d, ch, _p in books:
+            if seen >= chapter_tracks.MAX_TRACKS:
+                break
+            snaps[item_id] = await self.snap_for(          # a card being set up waits at most ~20 s
+                item_id, key, lambda sn, ch=ch, d=d: chapter_tracks.chapter_spans(ch, d, part, sn), budget=20)
+            seen += len(chapter_tracks.chapter_spans(ch, d, part))
+        return chapter_tracks.make_layout(books, part, snaps)
 
     def track_title(self, seg, multi_book: bool) -> str:
         label = f"{seg.number}. {seg.title}" if seg.chaptered and not seg.title.lower().startswith(("chapter", "part")) else seg.title
@@ -398,7 +449,7 @@ async def stream_icon(request: web.Request) -> web.Response:
     else:
         item_id, pos = slot.item_id, 0.0
         try:
-            prog = await br.abs.progress(item_id, br.cfg.abs_key_for(slot.device_id)) or {}
+            prog = await br.abs.progress(item_id, br.pm.key_for(slot, slot.device_id)) or {}
             pos = float(prog.get("currentTime") or 0)
         except ABSError:
             pass
@@ -433,7 +484,7 @@ async def stream(request: web.Request) -> web.StreamResponse:
     async def head_length() -> int:
         # Report a length without opening an ABS session.
         device = slot.device_id or br.cfg.device_for_ip(ip) or br.pm._device_from_events(slot.yoto_card_id)
-        key = br.cfg.abs_key_for(device)
+        key = br.pm.key_for(slot, device)
         following = await br.pm.resolve_series(slot, key) if slot.series_id else []
         prog = await br.abs.progress(slot.item_id, key) or {}
         item = await br.abs.item(slot.item_id)
@@ -475,7 +526,7 @@ async def resolve_track(br: Bridge, slot, layout_id: str, k: int, probe: bool = 
                 if not probe:
                     log.info("%s: resuming track %d at %.0fs (%.0fs back)", seg.book, k, req["start"], back)
         return req                                   # within a listen: next/previous/auto-advance, whole chapter
-    key = br.cfg.abs_key_for(slot.device_id or br.pm._device_from_events(slot.yoto_card_id))
+    key = br.pm.key_for(slot, slot.device_id or br.pm._device_from_events(slot.yoto_card_id))
     if slot.series_id:
         await br.pm.resolve_series(slot, key)        # the book ABS says is current
     item = slot.item_id if slot.series_id else seg.item_id
@@ -507,7 +558,7 @@ async def resolve_track(br: Bridge, slot, layout_id: str, k: int, probe: bool = 
     # no way to move the player (or it ignored the move): play from the listener's spot under this track
     if not probe:
         br.pm.exact_next.discard(slot.slot)
-    spans = chapter_tracks.chapter_spans(chapters, duration, br.cfg.part_seconds)
+    spans = chapter_tracks.chapter_spans(chapters, duration, br.cfg.part_seconds, br.snapper(item))
     end = spans[chapter_tracks.index_at(spans, start)][1] if spans else duration
     req.update(item_id=item, title=slot.title if slot.series_id else seg.book, start=start,
                end=max(end, start + 1), book_duration=duration)
@@ -773,7 +824,7 @@ async def _point_card(br: Bridge, slot, body: dict):
         slot.series_id = body.get("collection_id") or body["series_id"]
         slot.series_library = body.get("library_id", "")
         slot.series_name = body.get("series_name") or body.get("collection_name", "")
-        await br.pm.resolve_series(slot, br.cfg.abs_key_for(slot.device_id))
+        await br.pm.resolve_series(slot, br.pm.key_for(slot, slot.device_id))
     else:
         item = await br.abs.item(body["item_id"])
         slot.series_id = slot.series_name = slot.series_library = slot.group_kind = ""
@@ -875,7 +926,8 @@ async def api_seek(request):
     book, at = br.pm.book_position(pb)
     duration, chapters = await br.book_info(book.item_id)
     duration = duration or book.duration
-    spans = chapter_tracks.chapter_spans(chapters, duration, br.cfg.part_seconds) if len(chapters) >= 2 else []
+    spans = (chapter_tracks.chapter_spans(chapters, duration, br.cfg.part_seconds, br.snapper(book.item_id))
+             if len(chapters) >= 2 else [])
     if action == "back30":
         target = max(0.0, at - 30)
     elif action == "fwd30":
@@ -975,6 +1027,35 @@ async def api_card_speed(request):
     pb = br.pm.by_slot.get(slot.slot)
     await _apply_speed(br, [pb] if pb else [])
     return web.json_response({"ok": True, "speed": slot.speed})
+
+
+async def api_card_own_place(request):
+    """A card that keeps its own place: its listening is never written to ABS, and it resumes from the
+    place the bridge keeps for it (a bedtime card left running all night leaves the book alone).
+    Turning it on starts the card from where ABS has the book now; turning it off goes back to ABS's place."""
+    require_pin(request)
+    br: Bridge = request.app[BRIDGE]
+    slot = _card(br, request)
+    body = await request.json()
+    on = bool(body.get("own_place"))
+    if on == slot.own_place:
+        return web.json_response({"ok": True, "own_place": on})
+    if on:
+        await br.pm.finish_slot(slot.slot, "now keeps its own place")    # the last ABS write, then no more
+        plain = br.cfg.abs_key_for(slot.device_id)
+        br.abs.local.forget(slot.slot)
+        if slot.series_id:
+            await br.pm.resolve_series(slot, plain)
+        if slot.item_id:
+            prog = await br.abs.progress(slot.item_id, plain) or {}
+            br.abs.local.set(slot.slot, slot.item_id, float(prog.get("currentTime") or 0),
+                             float(prog.get("duration") or 0), bool(prog.get("isFinished")))
+    else:
+        await br.pm.finish_slot(slot.slot, "follows ABS again")
+    slot.own_place = on
+    br.store.save()
+    log.info("%s %s", slot.series_name or slot.title, "keeps its own place now" if on else "follows ABS again")
+    return web.json_response({"ok": True, "own_place": on})
 
 
 def _card(br, request):
@@ -1129,7 +1210,7 @@ async def api_card_icon_preview(request):
     else:
         item_id, pos = slot.item_id, 0.0
         try:
-            prog = await br.abs.progress(item_id, br.cfg.abs_key_for(slot.device_id)) or {}
+            prog = await br.abs.progress(item_id, br.pm.key_for(slot, slot.device_id)) or {}
             pos = float(prog.get("currentTime") or 0)
         except ABSError:
             pass
@@ -1153,6 +1234,7 @@ async def api_cards(request):
                                "yoto_card_id": s.yoto_card_id, "yoto_title": s.yoto_title,
                                "stream_url": br.stream_url(s.slot), "offline": _offline_info(s),
                                "series_id": s.series_id, "series_name": s.series_name, "speed": s.speed,
+                               "own_place": s.own_place,
                                "icon_style": s.icon_style, "icon_custom": bool(s.icon_custom),
                                "icon_chapters": len(s.icon_chapters), "ai_job": br.ai.status(s.slot),
                                "group_kind": (s.group_kind or "series") if s.series_id else ""}
@@ -1338,6 +1420,7 @@ def make_app(br: Bridge) -> web.Application:
     r.add_post("/api/cards/{slot}/offline", api_card_offline)
     r.add_post("/api/cards/{slot}/online", api_card_online)
     r.add_put("/api/cards/{slot}/speed", api_card_speed)
+    r.add_put("/api/cards/{slot}/own-place", api_card_own_place)
     r.add_put("/api/cards/{slot}/icon", api_card_icon)
     r.add_put("/api/cards/{slot}/icon/image", api_card_icon_image)
     r.add_get("/api/cards/{slot}/icon.png", api_card_icon_preview)

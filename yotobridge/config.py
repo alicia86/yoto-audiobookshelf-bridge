@@ -69,6 +69,7 @@ class Config:
     warm_refresh_seconds: int = 300   # how often to re-check ABS positions (listening on the phone moves them)
     chapter_tracks: bool = True       # one Yoto track per chapter, so the player's skip buttons move by chapter
     part_seconds: int = 1800          # track length for books without chapters
+    snap_cuts: bool = True            # cuts inside a chapter (parts, splits) move to the nearest pause
     chapter_icons: bool = True        # cover + chapter number on the Yoto's pixel display
     offline_hours: float = 5          # how much of the book "Make offline" copies (Yoto allows 5 h per card)
     offline_track_seconds: int = 3300  # longest uploaded track (Yoto allows 60 min); chapters are split to fit

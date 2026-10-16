@@ -1870,3 +1870,123 @@ async def test_position_counts_only_time_spent_playing(env):
     assert br.pm.position(pb) == pytest.approx(24.0, abs=0.3)
     control.connected = False                         # no pause events: the whole buffer is uncertain
     assert br.pm.position(pb) == pytest.approx(max(0.0, 24.0 + 2 * 3 - 2 * 20), abs=0.3)
+
+
+# ---------------------------------------------------------------- cards that keep their own place
+
+def _abs_writes(env):
+    return [c for c in env.abs.calls if c[0] in ("play", "sync", "close", "patch")]
+
+
+async def test_own_place_card_never_writes_to_abs(env):
+    """A bedtime card: it starts where ABS had the book when the option was turned on, then keeps its
+    own place; ABS sees no session and no position."""
+    br, client, _ = await env.make()
+    env.abs.progress["li1"] = {"currentTime": 25.0, "duration": 60.0}
+    s = card(br)
+    r = await client.put(f"/api/cards/{s.slot}/own-place", json={"own_place": True})
+    assert r.status == 200 and br.store.get(s.slot).own_place
+    assert (await client.get("/api/cards")).status == 200
+    before = list(_abs_writes(env))
+    r = await client.get(f"/s/{s.slot}.mp3")
+    assert int(r.headers["Content-Length"]) == (60 - 20) * BYTERATE     # from ABS's place (25 s - 5 s)
+    await r.read()
+    pb = br.pm.by_slot[s.slot]
+    assert pb.abs_session.startswith("local:")
+    pb.main_started -= 30
+    br.pm.on_bytes(pb, 30 * BYTERATE, True)
+    br.pm.on_event("dev-mini", {"cardId": "yc1", "position": 12, "playbackStatus": "paused"})
+    await asyncio.sleep(0.05)
+    await br.pm.finish_slot(s.slot, "test")
+    assert _abs_writes(env) == before                                    # nothing reached ABS
+    assert env.abs.progress["li1"]["currentTime"] == 25.0               # ABS's place untouched
+    own = br.abs.local.get(s.slot, "li1")
+    assert own["currentTime"] == pytest.approx(32.0, abs=0.5)           # the card's own place moved on
+    r = await client.get(f"/s/{s.slot}.mp3")                            # next tap: from the card's place
+    assert int(r.headers["Content-Length"]) == pytest.approx((60 - 27) * BYTERATE, abs=BYTERATE)
+    await r.read()
+
+
+async def test_own_place_off_follows_abs_again(env):
+    br, client, _ = await env.make()
+    env.abs.progress["li1"] = {"currentTime": 25.0, "duration": 60.0}
+    s = card(br)
+    await client.put(f"/api/cards/{s.slot}/own-place", json={"own_place": True})
+    br.abs.local.set(s.slot, "li1", 50.0, 60.0)
+    await client.put(f"/api/cards/{s.slot}/own-place", json={"own_place": False})
+    r = await client.get(f"/s/{s.slot}.mp3")
+    assert int(r.headers["Content-Length"]) == (60 - 20) * BYTERATE     # ABS's place again
+    await r.read()
+    assert ("play", "li1", f"yoto-{s.slot}") in env.abs.calls
+
+
+async def test_own_place_offline_copy_keeps_positions_on_the_bridge(env):
+    br, client, _ = await env.make(offline_track_seconds=15)
+    env.abs.progress["li1"] = {"currentTime": 25.0, "duration": 60.0}
+    s = card(br)
+    await client.put(f"/api/cards/{s.slot}/own-place", json={"own_place": True})
+    before = list(_abs_writes(env))
+    await client.post(f"/api/cards/{s.slot}/offline")
+    info = await _wait_offline(client, s.slot)
+    assert info["status"] == "ready", info
+    br.on_yoto_event("dev-mini", {"cardId": "yc1", "chapterKey": "03", "trackKey": "03", "position": 4,
+                                  "playbackStatus": "paused"})
+    for _ in range(100):
+        if (br.abs.local.get(s.slot, "li1") or {}).get("currentTime") == 44:
+            break
+        await asyncio.sleep(0.02)
+    assert br.abs.local.get(s.slot, "li1")["currentTime"] == 44
+    assert _abs_writes(env) == before and env.abs.progress["li1"]["currentTime"] == 25.0
+
+
+
+def _paused_book(env, item_id="lp"):
+    """A 20 s book without chapters whose audio pauses from 8 to 9.5 s."""
+    env.abs.extra[item_id] = {"id": item_id, "libraryId": "lib1", "mediaType": "book", "media": {
+        "duration": 20.0, "metadata": {"title": "Pause", "authorName": "Author", "series": []},
+        "tracks": [{"index": 1, "startOffset": 0, "duration": 20.0, "contentUrl": f"/api/items/{item_id}/file/9"}],
+        "chapters": []}}
+    return item_id
+
+
+async def test_pauses_are_found_in_the_audio(env):
+    br, _client, _ = await env.make()
+    tracks = br.pm._tracks(env.abs.item(_paused_book(env))["media"]["tracks"])
+    spots = await br.encoder.quiet_spots(tracks, 2.0, 18.0, br.abs.auth_header())
+    assert len(spots) == 1 and abs(spots[0][0] - 8) < 0.2 and abs(spots[0][1] - 9.5) < 0.2, spots
+
+
+async def test_a_cut_inside_a_chapter_moves_to_the_nearest_pause(env, tmp_path):
+    """A book without chapters in 10 s parts: the cut planned at 10 s moves into the pause at 8-9.5 s, on
+    the streaming card's tracks and in an offline copy, and the same book keeps the same cut."""
+    br, client, _ = await env.make(chapter_tracks=True, part_seconds=10, offline_whole_track_seconds=15)
+    s = card(br, item=_paused_book(env))
+    segs = await br.build_layout(s)
+    cut = segs[0].end
+    assert len(segs) == 2 and abs(cut - 8.75) < 0.1 and segs[1].start == cut, segs
+    calls = len(br.quiet.data["lp"]["scanned"])
+    assert [(g.start, g.end) for g in await br.build_layout(s)] == [(0.0, cut), (cut, 20.0)]
+    assert len(br.quiet.data["lp"]["scanned"]) == calls                 # not listened to again
+    assert (tmp_path / "quiet.json").exists()
+    r = await client.post(f"/api/cards/{s.slot}/offline", json={"mode": "book"})
+    assert r.status == 200
+    info = await _wait_offline(client, s.slot)
+    assert info["status"] == "ready", info
+    t = br.store.get(s.slot).offline["tracks"]
+    assert [(x["start"], x["end"]) for x in t] == [(0.0, cut), (cut, 20.0)], t
+    br2, _c, _ = await env.make(chapter_tracks=True, part_seconds=10, snap_cuts=False)
+    assert [(g.start, g.end) for g in await br2.build_layout(card(br2, item="lp"))] == [(0.0, 10.0), (10.0, 20.0)]
+
+
+def test_cuts_inside_chapters_snap_only_to_pauses_nearby():
+    from yotobridge.chapters import chapter_spans
+    from yotobridge.quiet import QuietSpots
+    q = QuietSpots("/nonexistent")
+    q.add("b", (0, 7200), [(1790.0, 1790.4), (1815.0, 1816.0), (3000.0, 3001.0)])
+    snap = q.snapper("b")
+    spans = chapter_spans([], 5400, 1800, snap)
+    # 1800: the longer pause 15 s on beats the short one 10 s before; 3600: nothing within 20 s
+    assert [e for _, e, _ in spans] == [1815.5, 3600, 5400]
+    long_chapter = [{"start": 0, "end": 5400, "title": "One"}, {"start": 5400, "end": 5500, "title": "Two"}]
+    assert [round(e, 1) for _, e, _ in chapter_spans(long_chapter, 5500, 1800, snap)] == [1815.5, 3600, 5400, 5500]
+    assert q.missing("b", [1800, 7300]) == [7300]

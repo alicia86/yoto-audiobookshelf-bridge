@@ -101,6 +101,41 @@ class Encoder:
                     proc.kill()
                     await proc.wait()
 
+    async def quiet_spots(self, tracks: list[Track], start: float, end: float, auth_header: str,
+                          noise_db: int = -35, min_len: float = 0.25) -> list[tuple[float, float]]:
+        """Pauses (start, end in book time) in book time [start, end), found by ffmpeg's silencedetect."""
+        spots: list[tuple[float, float]] = []
+        for t in tracks:
+            t_end = t.start + t.duration
+            if t_end <= start or t.start >= end:
+                continue
+            seek = max(0.0, start - t.start)
+            length = min(t_end, end) - max(t.start, start)
+            args = [self.ffmpeg, "-hide_banner", "-nostdin", "-nostats"]
+            if t.url.startswith("http") and auth_header:
+                args += ["-headers", f"Authorization: {auth_header}\r\n"]
+            if seek > 0.05:
+                args += ["-ss", f"{seek:.3f}"]
+            args += ["-i", t.url, "-t", f"{length:.3f}", "-vn",
+                     "-af", f"silencedetect=noise={noise_db}dB:d={min_len:g}", "-f", "null", "-"]
+            proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.DEVNULL,
+                                                        stderr=asyncio.subprocess.PIPE)
+            err = (await proc.communicate())[1].decode(errors="replace")
+            if proc.returncode:
+                raise SourceError(f"could not read the audio around {start:.0f}s: {' '.join(err.split())[-120:]}")
+            base = t.start + seek            # the timestamps silencedetect prints start at the seek point
+            s0 = None
+            for line in err.splitlines():
+                if "silence_start:" in line:
+                    s0 = float(line.rsplit("silence_start:", 1)[1].split()[0])
+                elif "silence_end:" in line and s0 is not None:
+                    e0 = float(line.rsplit("silence_end:", 1)[1].split()[0])
+                    spots.append((base + max(0.0, s0), base + e0))
+                    s0 = None
+            if s0 is not None:               # still quiet at the end of the window
+                spots.append((base + max(0.0, s0), base + length))
+        return spots
+
     async def exact(self, source: AsyncIterator[bytes], n: int) -> AsyncIterator[bytes]:
         """Deliver exactly n bytes: truncate the encoder's output or pad it with silence.
         The player was promised a Content-Length; a short body looks like a network error."""

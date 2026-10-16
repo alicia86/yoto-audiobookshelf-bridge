@@ -1,4 +1,4 @@
-import { ArrowRightLeft, CloudDownload, CloudOff, Gauge, Layers, Library as LibraryIcon, Plane, Plus, Recycle, RefreshCw, Trash2, TriangleAlert, Wifi } from "lucide-react"
+import { ArrowRightLeft, BookmarkCheck, CloudDownload, CloudOff, Gauge, Layers, Library as LibraryIcon, Plane, Plus, Recycle, RefreshCw, Trash2, TriangleAlert, Wifi } from "lucide-react"
 import { useCallback, useEffect, useRef, useState } from "react"
 import { toast } from "sonner"
 
@@ -219,6 +219,14 @@ export function CardsView(props: {
       speed ? `This card now plays at ${speedLabel(speed)}` : "This card now plays at the player's speed",
     )
 
+  const setOwnPlace = (slot: string, own_place: boolean) =>
+    run(
+      () => api(`/api/cards/${slot}/own-place`, { method: "PUT", body: { own_place } }),
+      own_place
+        ? "This card keeps its own place now; Audiobookshelf won't hear where it got to"
+        : "This card follows Audiobookshelf again",
+    )
+
   const chooseIcon = (card: CardSlot) =>
     iconSettings &&
     openSheet({
@@ -303,6 +311,7 @@ export function CardsView(props: {
                     </Button>
                   ))}
                 {c.item_id && <CardSpeed speed={c.speed} onChange={(v) => setSpeed(c.slot, v)} />}
+                {c.item_id && <CardPlace ownPlace={c.own_place} onChange={(v) => setOwnPlace(c.slot, v)} />}
                 {c.item_id && iconSettings?.enabled && (
                   <Button size="sm" variant="outline" onClick={() => chooseIcon(c)} aria-label="Pixel icon of this card">
                     <IconPreview slot={c.slot} className="size-5 rounded-sm" /> Icon
@@ -424,6 +433,21 @@ function CardSpeed({ speed, onChange }: { speed: number; onChange: (v: number) =
             {speedLabel(s)}
           </SelectItem>
         ))}
+      </SelectContent>
+    </Select>
+  )
+}
+
+function CardPlace({ ownPlace, onChange }: { ownPlace: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <Select value={ownPlace ? "own" : "abs"} onValueChange={(v) => onChange(v === "own")}>
+      <SelectTrigger size="sm" className="h-8 gap-1 px-2" aria-label="Where this card keeps its place">
+        <BookmarkCheck />
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        <SelectItem value="abs">Syncs with Audiobookshelf</SelectItem>
+        <SelectItem value="own">Keeps its own place</SelectItem>
       </SelectContent>
     </Select>
   )

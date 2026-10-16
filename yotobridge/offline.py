@@ -49,6 +49,7 @@ from . import chapters as chapter_tracks
 from .abs_client import ABSError
 from .series import group_books
 from .store import Slot
+from .quiet import Snap, cut
 from .streamer import SourceError
 
 log = logging.getLogger(__name__)
@@ -73,9 +74,10 @@ def _passing(e: BaseException) -> bool:
     return isinstance(e, (aiohttp.ClientConnectionError, asyncio.TimeoutError, ConnectionError, SourceError))
 
 
-def plan_segments(start: float, end: float, chapters: list[dict], max_len: float) -> list[tuple[float, float, str]]:
+def plan_segments(start: float, end: float, chapters: list[dict], max_len: float,
+                  snap: Snap | None = None) -> list[tuple[float, float, str]]:
     """Cut book time [start, end) into tracks: at chapter boundaries, long chapters split evenly into
-    pieces of at most max_len, runs of very short chapters merged."""
+    pieces of at most max_len (at the nearest pause, with snap), runs of very short chapters merged."""
     pieces: list[tuple[float, float, str]] = []
     chs = [c for c in chapters if float(c["end"]) > start and float(c["start"]) < end] or \
           [{"start": start, "end": end, "title": ""}]
@@ -86,9 +88,12 @@ def plan_segments(start: float, end: float, chapters: list[dict], max_len: float
         n = max(1, math.ceil((e - s) / max_len))
         step = (e - s) / n
         title = c.get("title") or ""
+        a = s
         for i in range(n):
             part = f"{title} ({i + 1}/{n})" if n > 1 and title else title
-            pieces.append((s + i * step, e if i == n - 1 else s + (i + 1) * step, part))
+            b = e if i == n - 1 else cut(snap, s + (i + 1) * step, a, e)
+            pieces.append((a, b, part))
+            a = b
     # first chapter seen may start before `start` only through the max() above; fill a gap at the
     # front (no chapter covers it) so the copy always begins exactly at `start`
     if pieces and pieces[0][0] > start + 0.5:
@@ -106,15 +111,15 @@ def plan_segments(start: float, end: float, chapters: list[dict], max_len: float
     return out[:MAX_TRACKS]
 
 
-def chapter_units(chapters: list[dict], duration: float, max_len: float,
-                  part_seconds: float = 1800) -> list[tuple[float, float, str, int]]:
+def chapter_units(chapters: list[dict], duration: float, max_len: float, part_seconds: float = 1800,
+                  snap: Snap | None = None) -> list[tuple[float, float, str, int]]:
     """A whole book as (start, end, title, chapter number) pieces, contiguous from 0 to the end, cut
     like a streaming card's chapter tracks (chapters.chapter_spans): one per chapter, a book without
     chapters in parts of part_seconds, and a chapter longer than two parts (a book listed as one or two
     huge "chapters") in parts of part_seconds; then anything longer than max_len split to fit."""
     spans = chapter_tracks.chapter_spans(
         sorted((c for c in chapters if 0 <= float(c.get("start", 0)) < duration), key=lambda c: float(c["start"])),
-        duration, int(part_seconds))
+        duration, int(part_seconds), snap)
     out = []
     for i, (s, e, title) in enumerate(spans):
         s = 0.0 if i == 0 else s
@@ -123,9 +128,12 @@ def chapter_units(chapters: list[dict], duration: float, max_len: float,
             continue
         n = max(1, math.ceil((e - s) / max_len - 1e-9))
         step = (e - s) / n
+        a = s
         for k in range(n):
             part = f"{title} ({k + 1}/{n})" if n > 1 and title else title
-            out.append((s + k * step, e if k == n - 1 else s + (k + 1) * step, part, i + 1))
+            b = e if k == n - 1 else cut(snap, s + (k + 1) * step, a, e)
+            out.append((a, b, part, i + 1))
+            a = b
     return out
 
 
@@ -141,17 +149,19 @@ def _pack(units, target: float, max_len: float) -> list[tuple[float, float, str]
             for s, e, first, last in out]
 
 
-def min_tracks(chapters: list[dict], duration: float, max_len: float, part_seconds: float = 1800) -> int:
+def min_tracks(chapters: list[dict], duration: float, max_len: float, part_seconds: float = 1800,
+               snap: Snap | None = None) -> int:
     """The fewest tracks a whole book can be cut into with tracks of at most max_len."""
-    return len(_pack(chapter_units(chapters, duration, max_len, part_seconds), max_len, max_len))
+    return len(_pack(chapter_units(chapters, duration, max_len, part_seconds, snap), max_len, max_len))
 
 
 def plan_whole(books: list[tuple[list[dict], float]], max_len: float, limit: int = WHOLE_TRACKS,
-               part_seconds: float = 1800) -> list[list[tuple[float, float, str]]]:
+               part_seconds: float = 1800, snaps: list[Snap | None] | None = None) -> list[list[tuple[float, float, str]]]:
     """Tracks for whole books (chapters, duration each), per book: one chapter per track when that fits
     in `limit` tracks, otherwise the shortest track length that fits, chapters kept whole where they can
     be. Tracks never span two books."""
-    units = [chapter_units(ch, dur, max_len, part_seconds) for ch, dur in books]
+    snaps = snaps or [None] * len(books)
+    units = [chapter_units(ch, dur, max_len, part_seconds, sn) for (ch, dur), sn in zip(books, snaps)]
 
     def plan(target):
         return [_pack(u, target, max_len) for u in units]
@@ -267,7 +277,7 @@ class OfflineManager:
     async def _build_inner(self, slot: Slot, hours: float, speed: float = 1.0, mode: str = "next"):
         br, cfg = self.br, self.cfg
         await br.pm.finish_slot(slot.slot, "making offline copy")
-        key = cfg.abs_key_for(slot.device_id)
+        key = br.pm.key_for(slot, slot.device_id)
         following = await br.pm.resolve_series(slot, key) if slot.series_id else []
         earlier = []
         if mode == "book":
@@ -454,7 +464,9 @@ class OfflineManager:
             if trks is None:
                 trks = br.pm._tracks(await br.abs.item_tracks(item_id, key))
             chapters = (await br.abs.item(item_id, key)).get("media", {}).get("chapters") or []
-            for s, e, ch in plan_segments(bstart, bend, chapters, max_len):
+            snap = await br.snap_for(item_id, key, lambda sn, b0=bstart, b1=bend, ch=chapters:
+                                     plan_segments(b0, b1, ch, max_len, sn))
+            for s, e, ch in plan_segments(bstart, bend, chapters, max_len, snap):
                 segments.append({"item_id": item_id, "book": title, "book_duration": dur, "tracks": trks,
                                  "start": s, "end": e, "title": ch})
             left -= bend - bstart
@@ -474,15 +486,18 @@ class OfflineManager:
                 [(slot.item_id, slot.title, duration, tracks)] + \
                 [(b.item_id, b.title, b.duration, None) for b in following]
         chapter_lists: dict[str, list] = {}
+        snaps: dict[str, object] = {}
 
         async def take(group):
             fit, chapters, size, ntracks = [], [], 0.0, 0
             for b in group:
                 if b[0] not in chapter_lists:
                     chapter_lists[b[0]] = (await br.abs.item(b[0], key)).get("media", {}).get("chapters") or []
+                    snaps[b[0]] = await br.snap_for(b[0], key, lambda sn, ch=chapter_lists[b[0]], d=b[2]:
+                                                    chapter_units(ch, d, max_len, cfg.part_seconds, sn))
                 ch = chapter_lists[b[0]]
                 audio = b[2] / speed * cfg.byterate
-                need = min_tracks(ch, b[2], max_len, cfg.part_seconds)
+                need = min_tracks(ch, b[2], max_len, cfg.part_seconds, snaps[b[0]])
                 if ntracks + need > WHOLE_TRACKS or (cap and size + audio > cap):
                     break
                 fit.append(b)
@@ -498,7 +513,8 @@ class OfflineManager:
                    else f"more than {WHOLE_TRACKS} tracks of {cfg.offline_whole_track_seconds / 3600:g} h")
             raise RuntimeError(f"the book is {duration / 3600:.1f} h at {speed:g}x, {why}. "
                                "Use a faster speed or the next 5 hours")
-        plans = plan_whole([(ch, b[2]) for ch, b in zip(chapters, fit)], max_len, part_seconds=cfg.part_seconds)
+        plans = plan_whole([(ch, b[2]) for ch, b in zip(chapters, fit)], max_len, part_seconds=cfg.part_seconds,
+                           snaps=[snaps[b[0]] for b in fit])
         segments = []
         for (item_id, title, dur, trks), plan in zip(fit, plans):
             if trks is None:
@@ -588,7 +604,7 @@ class OfflineManager:
         off = slot.offline
         seg = seg or off["tracks"][0]
         item_id = seg.get("item_id") or slot.item_id
-        key = self.cfg.abs_key_for(device_id or off.get("device_id", ""))
+        key = self.br.pm.key_for(slot, device_id or off.get("device_id", ""))
         order = off.get("books") or [item_id]
         cur = off.get("cur_item") or order[0]
         if item_id != cur and item_id in order and cur in order and order.index(item_id) > order.index(cur):

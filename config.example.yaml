@@ -21,6 +21,7 @@ yoto_client_id: "paste-yoto-client-id"
 # library_ids: [lib_xxxxxxxx]   # only show these ABS libraries on the phone page
 # yoto_redirect_uri: http://127.0.0.1:8787/callback   # only if you cannot use the default above; see README
 # chapter_tracks: true           # one Yoto track per chapter: the player's next/previous skip chapters
+# snap_cuts: true                # cuts inside a chapter (30-min parts, splits) move to the nearest pause
 # chapter_icons: true            # cover + chapter number on the Yoto's display (offline copies need the user:icons:manage scope)
 # offline_hours: 5               # how much of a book "Make offline" puts on the card (Yoto max 5)
 # offline_whole_track_seconds: 0  # longest track of a whole-book/series offline copy in seconds (0 = just under 2 h,

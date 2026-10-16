@@ -92,6 +92,7 @@ export type CardSlot = {
   series_name: string
   group_kind: "" | "series" | "collection"
   speed: number // 0 = the player's speed
+  own_place: boolean // keeps its own place: listening is never written to Audiobookshelf
   icon_style: string // "" = the default style
   icon_custom: boolean // a picture of the owner's own is uploaded
   icon_chapters: number // chapters with a picture of their own

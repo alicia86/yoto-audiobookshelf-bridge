@@ -15,12 +15,15 @@ or collection (at most 99 tracks). What a track plays is decided when the player
 
 The layout only changes when the book (or the window of a very long book) changes. Track URLs carry
 the layout id, so a player still holding an older playlist of the same books gets what it expects.
-Books without chapters, and chapters longer than an hour, are cut into parts of part_seconds.
+Books without chapters, and chapters longer than an hour, are cut into parts of part_seconds; those
+cuts move to the nearest pause (quiet.py) when the book's pauses are known.
 """
 from __future__ import annotations
 
 import secrets
 from dataclasses import asdict, dataclass
+
+from .quiet import Snap, cut
 
 MAX_TRACKS = 99
 KEEP_LAYOUTS = 20          # a player may hold an older list for a while; layouts are small
@@ -38,22 +41,26 @@ class Segment:
     chaptered: bool = True     # False: a fixed-length part of a book without chapters
 
 
-def chapter_spans(chapters: list[dict], duration: float, part_seconds: int) -> list[tuple[float, float, str]]:
+def chapter_spans(chapters: list[dict], duration: float, part_seconds: int,
+                  snap: Snap | None = None) -> list[tuple[float, float, str]]:
     """(start, end, title) per track: each chapter, with chapters longer than two parts split evenly
     into parts of at most part_seconds (some books have 2 "chapters" for 6 hours); books with fewer
-    than 2 chapters get fixed-length parts."""
+    than 2 chapters get fixed-length parts. snap moves the cuts that are not chapter boundaries."""
     out = []
-    for start, end, title in _raw_spans(chapters, duration, part_seconds):
+    for start, end, title in _raw_spans(chapters, duration, part_seconds, snap):
         n = 1 if end - start <= 2 * part_seconds else -(-(end - start) // part_seconds)
         n = int(n)
         step = (end - start) / n
+        s = start
         for i in range(n):
-            out.append((start + i * step, end if i == n - 1 else start + (i + 1) * step,
-                        f"{title} ({i + 1}/{n})" if n > 1 else title))
+            e = end if i == n - 1 else cut(snap, start + (i + 1) * step, s, end)
+            out.append((s, e, f"{title} ({i + 1}/{n})" if n > 1 else title))
+            s = e
     return out
 
 
-def _raw_spans(chapters: list[dict], duration: float, part_seconds: int) -> list[tuple[float, float, str]]:
+def _raw_spans(chapters: list[dict], duration: float, part_seconds: int,
+               snap: Snap | None = None) -> list[tuple[float, float, str]]:
     if len(chapters) >= 2:
         spans = []
         for i, c in enumerate(chapters):
@@ -63,25 +70,29 @@ def _raw_spans(chapters: list[dict], duration: float, part_seconds: int) -> list
             if end - start > 0.5:
                 spans.append((start, end, c.get("title") or f"Chapter {i + 1}"))
         if spans:
-            return _fill_gaps(spans, duration, part_seconds)
+            return _fill_gaps(spans, duration, part_seconds, snap)
     out, t, n = [], 0.0, 1
     while t < duration - 0.5:
-        out.append((t, min(duration, t + part_seconds), f"Part {n}"))
-        t += part_seconds
+        e = min(duration, n * part_seconds)
+        e = e if e >= duration else cut(snap, e, t, duration)
+        out.append((t, e, f"Part {n}"))
+        t = e
         n += 1
     return out or [(0.0, duration, "Part 1")]
 
 
 def _fill_gaps(spans: list[tuple[float, float, str]], duration: float,
-               part_seconds: int) -> list[tuple[float, float, str]]:
+               part_seconds: int, snap: Snap | None = None) -> list[tuple[float, float, str]]:
     """Cover audio no chapter covers (broken chapter data: a 20 h book listed as one 2 h chapter and an
     empty one) with parts of part_seconds, so every second of the book is on some track."""
     out, t, n = [], 0.0, 1
     for start, end, title in spans + [(duration, duration, "")]:
+        gap, k = t, 1
         while start - t > 0.5:
-            e = min(start, t + part_seconds)
+            e = min(start, gap + k * part_seconds)
+            e = e if e >= start else cut(snap, e, t, start)
             out.append((t, e, f"Part {n}"))
-            t, n = e, n + 1
+            t, n, k = e, n + 1, k + 1
         if title:
             out.append((start, end, title))
         t = max(t, end)
@@ -105,12 +116,14 @@ def window_start(index: int, total: int) -> int:
     return min((index // WINDOW_STEP) * WINDOW_STEP, total - MAX_TRACKS)
 
 
-def make_layout(books: list[tuple[str, str, float, list, float]], part_seconds: int) -> list[Segment]:
+def make_layout(books: list[tuple[str, str, float, list, float]], part_seconds: int,
+                snaps: dict[str, Snap | None] | None = None) -> list[Segment]:
     """books: (item_id, title, duration, chapters, position) from the current book on, each from its
-    first chapter (a book with more than 99 tracks starts a few before the one holding the position)."""
+    first chapter (a book with more than 99 tracks starts a few before the one holding the position).
+    snaps: per book, where its cuts inside chapters move to (quiet.py)."""
     segs: list[Segment] = []
     for n, (item_id, title, duration, chapters, pos) in enumerate(books):
-        spans = chapter_spans(chapters, duration, part_seconds)
+        spans = chapter_spans(chapters, duration, part_seconds, (snaps or {}).get(item_id))
         first = 0 if n or len(spans) <= MAX_TRACKS else window_start(index_at(spans, pos), len(spans))
         for i in range(first, len(spans)):
             s, e, t = spans[i]

@@ -22,6 +22,7 @@ KEY2 = "abs-test-key-child2"    # a second ABS user, with its own progress
 # A 60 s book in three files with different tones, so tests can tell where in the book audio comes from.
 FILES = [("part1.m4a", 440), ("part2.mp3", 880), ("part3.mp3", 1320)]
 PART = 20.0
+GAP_FILE = "pause.mp3"          # served as file 9
 
 
 @pytest.fixture(scope="session")
@@ -31,6 +32,10 @@ def audio_dir(tmp_path_factory):
         codec = ["-c:a", "aac"] if name.endswith("m4a") else ["-c:a", "libmp3lame"]
         subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", f"sine=frequency={hz}:duration={PART}",
                         *codec, str(d / name)], check=True)
+    # GAP_FILE: 20 s of tone with a pause from 8 to 9.5 s, a place to cut a track
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", f"sine=frequency=500:duration={PART}",
+                    "-af", "volume=enable='between(t,8,9.5)':volume=0", "-c:a", "libmp3lame", str(d / GAP_FILE)],
+                   check=True)
     return d
 
 
@@ -121,6 +126,11 @@ class FakeABS:
             p = self._p(r).get(iid, {})
             self.sessions[sid] = {"item": iid, "open": True, "progress": self._p(r)}
             self.calls.append(("play", iid, body["deviceInfo"]["deviceId"]))
+            if iid in self.extra:                # a book of its own: its duration and files
+                media = self.item(iid)["media"]
+                return web.json_response({"id": sid, "libraryItemId": iid, "duration": media["duration"],
+                                          "startTime": p.get("currentTime", 0), "currentTime": p.get("currentTime", 0),
+                                          "audioTracks": media["tracks"]})
             return web.json_response({
                 "id": sid, "libraryItemId": iid, "duration": PART * 3,
                 "startTime": p.get("currentTime", 0), "currentTime": p.get("currentTime", 0),
@@ -165,6 +175,8 @@ class FakeABS:
             if self.down_files > 0:
                 self.down_files -= 1
                 return web.Response(status=503, text="restarting")
+            if r.match_info["n"] == "9":
+                return web.FileResponse(self.audio_dir / GAP_FILE)
             return web.FileResponse(self.audio_dir / FILES[int(r.match_info["n"])][0])
 
         async def cover(r):
