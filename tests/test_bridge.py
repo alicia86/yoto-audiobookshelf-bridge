@@ -1990,3 +1990,86 @@ def test_cuts_inside_chapters_snap_only_to_pauses_nearby():
     long_chapter = [{"start": 0, "end": 5400, "title": "One"}, {"start": 5400, "end": 5500, "title": "Two"}]
     assert [round(e, 1) for _, e, _ in chapter_spans(long_chapter, 5500, 1800, snap)] == [1815.5, 3600, 5400, 5500]
     assert q.missing("b", [1800, 7300]) == [7300]
+
+
+async def test_offline_copies_wait_their_turn_and_show_progress(env):
+    """Two Make offline presses: the second copy waits (its card untouched, still streaming) until the
+    first is done; the card list shows each copy's progress and place in the queue."""
+    br, client, _ = await env.make(offline_track_seconds=25, offline_whole_track_seconds=25)
+    a, b = card(br), card(br, item="li2", yoto_card_id="yc2")
+    b.title = "Other"
+    gate, real, order = asyncio.Event(), br.yoto.upload_audio, []
+
+    async def upload(audio, name, **kw):
+        order.append(name)
+        await gate.wait()
+        return await real(audio, name, **kw)
+    br.yoto.upload_audio = upload
+    await client.post(f"/api/cards/{a.slot}/offline", json={"mode": "book"})
+    await client.post(f"/api/cards/{b.slot}/offline", json={"mode": "book"})
+    for _ in range(200):
+        if order and br.offline.waiting:
+            break
+        await asyncio.sleep(0.02)
+    cards = {c["slot"]: c["offline"] for c in await (await client.get("/api/cards")).json()}
+    first, second = cards[a.slot], cards[b.slot]
+    assert first["queued"] is False and first["queue_position"] == 0
+    assert first["phase"] == "uploading" and first["current"] == 1 and first["done"] == 0
+    assert abs(first["progress"] - 0.6 / first["tracks"]) < 1e-6   # track 1 encoded, not yet at Yoto
+    assert second["queued"] is True and second["queue_position"] == 1 and second["progress"] == 0
+    assert not any(p.get("cardId") == "yc2" for p in env.yoto.posts)    # the queued card is untouched
+    gate.set()
+    assert (await _wait_offline(client, a.slot))["status"] == "ready"
+    assert (await _wait_offline(client, b.slot))["status"] == "ready"
+    books = [n.rsplit(" ", 1)[0] for n in order]
+    assert books == sorted(books, key=lambda n: n != "Book")    # every track of card 1 before card 2's
+    assert not br.offline.waiting
+
+
+async def test_cancelling_a_queued_copy_takes_it_out_of_the_queue(env):
+    br, client, _ = await env.make(offline_track_seconds=25, offline_whole_track_seconds=25, offline_parallel=1)
+    a, b = card(br), card(br, item="li2", yoto_card_id="yc2")
+    b.title = "Other"
+    gate, real = asyncio.Event(), br.yoto.upload_audio
+
+    async def upload(audio, name, **kw):
+        await gate.wait()
+        return await real(audio, name, **kw)
+    br.yoto.upload_audio = upload
+    await client.post(f"/api/cards/{a.slot}/offline", json={"mode": "book"})
+    await client.post(f"/api/cards/{b.slot}/offline", json={"mode": "book"})
+    for _ in range(200):
+        if br.offline.waiting:
+            break
+        await asyncio.sleep(0.02)
+    assert (await client.post(f"/api/cards/{b.slot}/online")).status == 200
+    for _ in range(100):
+        if not br.offline.waiting:
+            break
+        await asyncio.sleep(0.02)
+    assert not br.offline.waiting and br.store.get(b.slot).offline == {}
+    gate.set()
+    assert (await _wait_offline(client, a.slot))["status"] == "ready"
+
+
+async def test_two_copies_at_once_when_offline_parallel_allows(env):
+    br, client, _ = await env.make(offline_track_seconds=25, offline_whole_track_seconds=25, offline_parallel=2)
+    a, b = card(br), card(br, item="li2", yoto_card_id="yc2")
+    b.title = "Other"
+    gate, real, names = asyncio.Event(), br.yoto.upload_audio, set()
+
+    async def upload(audio, name, **kw):
+        names.add(name)
+        await gate.wait()
+        return await real(audio, name, **kw)
+    br.yoto.upload_audio = upload
+    await client.post(f"/api/cards/{a.slot}/offline", json={"mode": "book"})
+    await client.post(f"/api/cards/{b.slot}/offline", json={"mode": "book"})
+    for _ in range(200):
+        if len(names) == 2:
+            break
+        await asyncio.sleep(0.02)
+    assert len(names) == 2 and not br.offline.waiting
+    gate.set()
+    assert (await _wait_offline(client, a.slot))["status"] == "ready"
+    assert (await _wait_offline(client, b.slot))["status"] == "ready"

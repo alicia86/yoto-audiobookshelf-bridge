@@ -69,6 +69,13 @@ export type Offline = {
   mode?: "next" | "book" | "series"
   books_left_off?: number
   on_card?: number // while building: tracks already on the card (the rest stream)
+  // while building:
+  progress?: number // 0 to 1: tracks done plus the part of the one in flight
+  done?: number // tracks finished (uploaded and processed by Yoto)
+  current?: number // the track in flight, from 1
+  phase?: "" | "encoding" | "uploading" | "processing"
+  queued?: boolean // waiting for another copy to finish; the card is untouched until then
+  queue_position?: number // 1 = next to start
   hours?: number
   speed?: number
   start?: number

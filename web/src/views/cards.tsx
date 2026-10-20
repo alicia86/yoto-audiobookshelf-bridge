@@ -1,4 +1,4 @@
-import { ArrowRightLeft, BookmarkCheck, CloudDownload, CloudOff, Gauge, Layers, Library as LibraryIcon, Plane, Plus, Recycle, RefreshCw, Trash2, TriangleAlert, Wifi } from "lucide-react"
+import { ArrowRightLeft, BookmarkCheck, Clock, CloudDownload, CloudUpload, CloudOff, Gauge, Layers, Library as LibraryIcon, Plane, Plus, Recycle, RefreshCw, Trash2, TriangleAlert, Wifi } from "lucide-react"
 import { useCallback, useEffect, useRef, useState } from "react"
 import { toast } from "sonner"
 
@@ -8,6 +8,7 @@ import { useOverlays } from "@/components/overlays"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
+import { Progress } from "@/components/ui/progress"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import type { Picked } from "@/lib/actions"
 import { api, errorText, hms, SPEEDS, speedLabel } from "@/lib/api"
@@ -269,6 +270,7 @@ export function CardsView(props: {
       <Button variant="outline" className="self-start" onClick={moveOldCard}>
         <ArrowRightLeft /> Move an old card (keeps the place)
       </Button>
+      {cards && <OfflineSummary cards={cards} />}
       {error ? (
         <Empty>{error}</Empty>
       ) : !cards ? (
@@ -453,16 +455,73 @@ function CardPlace({ ownPlace, onChange }: { ownPlace: boolean; onChange: (v: bo
   )
 }
 
+const PHASES: Record<string, string> = {
+  encoding: "making the audio",
+  uploading: "sending it to Yoto",
+  processing: "Yoto is processing it",
+}
+
+const ordinal = (n: number) => (n === 1 ? "next" : `${n}${n === 2 ? "nd" : n === 3 ? "rd" : "th"}`)
+
+// All offline copies being made: one bar over every track of the copies under way, and how many wait
+function OfflineSummary({ cards }: { cards: CardSlot[] }) {
+  const building = cards.filter((c) => c.offline?.status === "building").map((c) => c.offline!)
+  if (!building.length) return null
+  const queued = building.filter((o) => o.queued).length
+  const running = building.filter((o) => !o.queued)
+  const total = running.reduce((n, o) => n + (o.tracks || 0), 0)
+  const done = running.reduce((n, o) => n + (o.done || 0), 0)
+  const value = total ? running.reduce((n, o) => n + (o.progress || 0) * (o.tracks || 0), 0) / total : 0
+  return (
+    <Card className="gap-2 p-3">
+      <p className="flex items-center gap-1.5 text-sm font-medium">
+        <CloudUpload className="size-4 shrink-0" /> Offline uploads
+        <span className="ml-auto text-xs font-normal text-muted-foreground tabular-nums">{Math.round(value * 100)}%</span>
+      </p>
+      <Progress value={value * 100} aria-label="All offline uploads" />
+      <p className="text-xs text-muted-foreground">
+        {running.length
+          ? `${running.length === 1 ? "1 copy" : `${running.length} copies`} being made: ${done} of ${total || "?"} tracks uploaded.`
+          : "Starting…"}
+        {queued ? ` ${queued} more waiting ${queued === 1 ? "its" : "their"} turn.` : ""}
+      </p>
+    </Card>
+  )
+}
+
 function OfflineLine({ card }: { card: CardSlot }) {
   const o = card.offline
   if (!o) return null
-  if (o.status === "building")
+  if (o.status === "building" && o.queued)
     return (
-      <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
-        <CloudDownload className="size-4 shrink-0 animate-pulse" /> Making offline copy: {o.step}…
-        {o.on_card ? ` ${o.on_card} of ${o.tracks} tracks on the card, the rest stream.` : ""}
+      <p className="mt-1 flex items-start gap-1.5 text-sm text-muted-foreground">
+        <Clock className="mt-0.5 size-4 shrink-0" /> Offline copy queued
+        {o.queue_position ? ` (${ordinal(o.queue_position)} in line)` : ""}. The card streams as usual until its turn.
       </p>
     )
+  if (o.status === "building") {
+    const pct = Math.round((o.progress || 0) * 100)
+    const what =
+      o.current && o.tracks && o.phase
+        ? `track ${o.current} of ${o.tracks}, ${PHASES[o.phase] ?? o.phase}`
+        : o.step
+    return (
+      <div className="mt-1 flex flex-col gap-1 text-sm text-muted-foreground">
+        <p className="flex items-start gap-1.5">
+          <CloudDownload className="mt-0.5 size-4 shrink-0 animate-pulse" /> Making offline copy: {what}…
+        </p>
+        {o.tracks > 0 && (
+          <>
+            <Progress value={pct} aria-label="Offline copy progress" />
+            <p className="text-xs tabular-nums">
+              {o.done ?? 0} of {o.tracks} tracks uploaded ({pct}%)
+              {o.on_card ? `, ${o.on_card} on the card, the rest stream.` : "."}
+            </p>
+          </>
+        )}
+      </div>
+    )
+  }
   if (o.status === "failed")
     return (
       <p className="mt-1 flex items-start gap-1.5 text-sm text-destructive">

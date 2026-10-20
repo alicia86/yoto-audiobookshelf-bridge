@@ -248,18 +248,23 @@ class YotoAPI:
         return f"yoto:#{r['displayIcon']['mediaId']}"
 
 
-    async def upload_audio(self, audio: bytes, title: str) -> dict:
+    async def upload_audio(self, audio: bytes, title: str, on_phase=None) -> dict:
         """Upload one MP3 as MYO audio (yoto.dev "uploading to cards"): get a signed URL, PUT the file,
         wait for Yoto's transcode. Returns the track fields for a playlist. Yoto sometimes never finishes
         a job (seen: a 2 h track still processing after 15 min, when others that long took 1-2 min), so
-        a job that takes longer than TRANSCODE_TIMEOUT is given up and the track uploaded again."""
+        a job that takes longer than TRANSCODE_TIMEOUT is given up and the track uploaded again.
+        on_phase("uploading" / "processing") is told which stage it is at."""
         for attempt in range(1, self.TRANSCODE_TRIES + 1):
+            if on_phase:
+                on_phase("uploading")
             up = (await self._req("GET", "/media/transcode/audio/uploadUrl")).get("upload", {})
             async with self.http.put(up["uploadUrl"], data=audio, headers={"Content-Type": "audio/mpeg"},
                                      timeout=aiohttp.ClientTimeout(total=1800)) as r:
                 if r.status >= 400:
                     raise RuntimeError(f"Yoto upload of {title} -> {r.status}: {(await r.text())[:200]}")
             began = time.monotonic()
+            if on_phase:
+                on_phase("processing")
             while time.monotonic() - began < self.TRANSCODE_TIMEOUT:
                 t = (await self._req("GET", f"/media/upload/{up['uploadId']}/transcoded",
                                      params={"loudnorm": "false"})).get("transcode", {})

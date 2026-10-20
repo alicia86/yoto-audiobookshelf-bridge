@@ -35,10 +35,17 @@ as one huge chapter), goes in 30 min parts (`part_seconds`), so no single track 
 (a 19 h track of 548 MB never finished processing at Yoto). With a track limit
 set, a series too long for 99 such tracks takes as many whole books as fit, and a single book too long
 for them fails with a message.
+
+Copies wait their turn: `offline_parallel` (default 1) are made at once and the rest are queued, in the
+order Make offline was pressed. Each copy keeps an ffmpeg encoding on the bridge's machine (next to any card
+streaming, which must keep up in real time), reads its whole book from ABS, holds a track of up to
+~55 MB in memory, and has Yoto process its uploads; one at a time keeps all of that small. A queued
+card keeps streaming as before, untouched, until its turn comes.
 """
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import time
@@ -65,6 +72,26 @@ LIVE_SECONDS = 120       # or every 2 minutes
 # Audiobookshelf (or the network) away: wait and carry on, keeping the uploaded tracks; about an hour
 # in all before the copy is called failed. A track getting through starts the count again.
 RETRY_WAITS = (60, 120, 300, 600, 900, 900, 900)
+# how far through a track each stage counts, for the progress bar (encoding runs from 0 to ENCODED)
+ENCODED, SENT = 0.6, 0.7
+
+
+def holds_copy(slot: Slot) -> bool:
+    """Has an offline copy changed this card (made, being made, or failed)? A copy still waiting its
+    turn has not touched the card yet, so the card streams exactly as before."""
+    return bool(slot.offline) and not slot.offline.get("queued")
+
+
+def progress(off: dict | None) -> float | None:
+    """How far a copy being made is, 0 to 1: finished tracks, plus the part of the one in flight."""
+    if not off or off.get("status") != "building":
+        return None
+    total = len(off.get("tracks") or [])
+    if not total:
+        return 0.0
+    part = {"encoding": ENCODED * float(off.get("encoded") or 0), "uploading": ENCODED,
+            "processing": SENT}.get(off.get("phase") or "", 0.0)
+    return min(1.0, (int(off.get("done") or 0) + part) / total)
 
 
 def _passing(e: BaseException) -> bool:
@@ -192,6 +219,8 @@ class OfflineManager:
         self.br = bridge
         self.cfg = bridge.cfg
         self.tasks: dict[str, asyncio.Task] = {}
+        self.waiting: list[str] = []          # slots of queued copies, first in line first
+        self._gate: asyncio.Semaphore | None = None
 
     # ---------------- building ----------------
 
@@ -221,8 +250,10 @@ class OfflineManager:
                        f"{self.cfg.bitrate_kbps}"
                 if done.pop(ukey, None):
                     log.info("offline copy of %s: track %s will be uploaded again", slot.title, t["key"])
+        # a copy carried on after a restart keeps its place in the queue
+        queued_at = prev.get("queued_at") if prev.get("status") == "building" else None
         slot.offline = {"status": "building", "step": "starting", "mode": mode, "hours": hours, "speed": speed,
-                        "started_at": time.time(), "uploads": done or {}}
+                        "started_at": time.time(), "queued_at": queued_at or time.time(), "uploads": done or {}}
         self.br.store.save()
         self.tasks[slot.slot] = asyncio.get_running_loop().create_task(self._build(slot, hours, speed, mode))
         return slot.offline
@@ -230,7 +261,9 @@ class OfflineManager:
     def resume_interrupted(self):
         """At start-up: carry on with copies that were being made when the bridge stopped (a deploy or
         restart), reusing the tracks already uploaded. Until then the card still streams."""
-        for slot in list(self.br.store.state.slots.values()):
+        slots = sorted(self.br.store.state.slots.values(),
+                       key=lambda s: float((s.offline or {}).get("queued_at") or 0))
+        for slot in slots:
             off = slot.offline or {}
             if off.get("status") != "building" or (slot.slot in self.tasks and not self.tasks[slot.slot].done()):
                 continue
@@ -246,7 +279,8 @@ class OfflineManager:
         waits, had = iter(self.RETRY_WAITS), -1
         while True:
             try:
-                await self._build_inner(slot, hours, speed, mode)
+                async with self._turn(slot):
+                    await self._build_inner(slot, hours, speed, mode)
                 return
             except Exception as e:
                 have = len((slot.offline or {}).get("uploads") or {})
@@ -263,6 +297,35 @@ class OfflineManager:
                                         f"trying again in {wait / 60:.0f} min")
                 self.br.store.save()
                 await asyncio.sleep(wait)
+
+    @contextlib.asynccontextmanager
+    async def _turn(self, slot: Slot):
+        """Wait until fewer than offline_parallel copies are being made, first come first served."""
+        if self._gate is None:
+            self._gate = asyncio.Semaphore(max(1, int(self.cfg.offline_parallel or 1)))
+        gate = self._gate
+        if gate.locked():
+            self.waiting.append(slot.slot)
+            slot.offline.update(queued=True, step="waiting for the copy ahead to finish")
+            self.br.store.save()
+            log.info("offline copy of %s is queued (%d in line)", slot.series_name or slot.title, len(self.waiting))
+            try:
+                await gate.acquire()
+            finally:
+                self.waiting.remove(slot.slot)
+            slot.offline.pop("queued", None)
+            slot.offline["step"] = "starting"
+            self.br.store.save()
+        else:
+            await gate.acquire()
+        try:
+            yield
+        finally:
+            gate.release()
+
+    def queue_position(self, slot_id: str) -> int:
+        """1 for the next copy to start, 0 if not queued."""
+        return self.waiting.index(slot_id) + 1 if slot_id in self.waiting else 0
 
     async def _failed(self, slot: Slot, e: BaseException):
         log.error("offline copy of %s failed", slot.title, exc_info=e)
@@ -370,7 +433,13 @@ class OfflineManager:
 
         await save_live(force=True)
         done = slot.offline.setdefault("uploads", {})
+        off = slot.offline
+
+        def phase(name: str):
+            off["phase"], off["encoded"] = name, 0.0 if name == "encoding" else off.get("encoded", 0.0)
+
         for i, seg in enumerate(segments):
+            off.update(done=i, current=i + 1)
             slot.offline["step"] = f"uploading track {i + 1} of {len(segments)}"
             br.store.save()
             ukey = f"{seg['item_id']}:{seg['start']:.1f}:{seg['end']:.1f}:{speed:g}:{cfg.bitrate_kbps}"
@@ -379,19 +448,23 @@ class OfflineManager:
             else:
                 n = int((seg["end"] - seg["start"]) * cfg.byterate / speed)
                 audio = bytearray()
+                phase("encoding")
                 src = br.encoder.stream(seg["tracks"], seg["start"], seg["end"], br.abs.auth_header(key), speed=speed,
                                          strict=True)
                 async for chunk in br.encoder.exact(src, n):
                     audio += chunk
+                    off["encoded"] = len(audio) / max(1, n)
                 log.info("offline copy of %s: track %d of %d encoded (%.0f min, %.0f MB), uploading",
                          slot.series_name or slot.title, i + 1, len(segments),
                          (seg["end"] - seg["start"]) / speed / 60, len(audio) / 1e6)
-                info = await br.yoto.upload_audio(bytes(audio), f"{seg['book']} {i + 1}")
+                phase("uploading")
+                info = await br.yoto.upload_audio(bytes(audio), f"{seg['book']} {i + 1}", on_phase=phase)
                 del audio
                 done[ukey] = dict(info)
                 br.store.save()
             info["icon"] = await br.uploaded_icon(slot, seg["item_id"], seg["start"])
             infos[i] = info
+            off.update(done=i + 1, phase="")
             if i + 1 < len(segments):
                 await save_live()
         uploaded = [{**info, "key": f"{i + 1:02d}", "title": titles[i]} for i, info in enumerate(infos)]

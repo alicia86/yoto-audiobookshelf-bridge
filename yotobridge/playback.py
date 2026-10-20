@@ -336,7 +336,7 @@ class PlaybackManager:
 
     async def prepare(self, slot: Slot):
         secs = self.cfg.warm_start_seconds
-        if (not secs or not self.encoder or slot.offline or not slot.item_id or slot.slot in self.by_slot
+        if (not secs or not self.encoder or (slot.offline and not slot.offline.get("queued")) or not slot.item_id or slot.slot in self.by_slot
                 or self.cfg.resume_mode != "server"):
             return
         key = self.key_for(slot, slot.device_id)

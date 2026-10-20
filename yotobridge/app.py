@@ -22,7 +22,7 @@ from . import chapters as chapter_tracks
 from . import icons
 from .icon_themes import IconLibrary
 from .ai_pictures import AIPictures, AISettings
-from .offline import OfflineManager
+from .offline import OfflineManager, holds_copy, progress as offline_progress
 from .series import CollectionIndex, _series_entries, group_books
 from .config import Config
 from .playback import PlaybackManager
@@ -543,7 +543,7 @@ async def resolve_track(br: Bridge, slot, layout_id: str, k: int, probe: bool = 
             br.jumping.pop(slot.slot, None)          # the player is where it should be
         req["start"] = max(seg.start, start)         # a plain tap on the listener's chapter: resume
         return req
-    if slot.offline and layout_id == slot.layout_id:
+    if holds_copy(slot) and layout_id == slot.layout_id:
         # an offline copy still uploading: its uploaded tracks play from the card, so a request for a
         # streamed one is the listener choosing it (skip, next track), never a stale resume to correct
         if not probe:
@@ -1232,7 +1232,7 @@ async def api_cards(request):
     br: Bridge = request.app[BRIDGE]
     return web.json_response([{"slot": s.slot, "item_id": s.item_id, "title": s.title,
                                "yoto_card_id": s.yoto_card_id, "yoto_title": s.yoto_title,
-                               "stream_url": br.stream_url(s.slot), "offline": _offline_info(s),
+                               "stream_url": br.stream_url(s.slot), "offline": _offline_info(br, s),
                                "series_id": s.series_id, "series_name": s.series_name, "speed": s.speed,
                                "own_place": s.own_place,
                                "icon_style": s.icon_style, "icon_custom": bool(s.icon_custom),
@@ -1241,13 +1241,18 @@ async def api_cards(request):
                               for s in br.store.cards()])
 
 
-def _offline_info(s) -> dict | None:
+def _offline_info(br, s) -> dict | None:
     o = s.offline
     if not o:
         return None
     keep = ("status", "step", "error", "mode", "hours", "speed", "start", "end", "last_pos", "last_event_at",
-            "from_title", "to_title", "last_book", "books_left_off", "on_card")
-    return {**{k: o[k] for k in keep if k in o}, "tracks": len(o.get("tracks", []))}
+            "from_title", "to_title", "last_book", "books_left_off", "on_card", "done", "current", "phase")
+    info = {**{k: o[k] for k in keep if k in o}, "tracks": len(o.get("tracks", []))}
+    if o.get("status") == "building":
+        info["progress"] = offline_progress(o)
+        info["queued"] = s.slot in br.offline.waiting or bool(o.get("queued"))
+        info["queue_position"] = br.offline.queue_position(s.slot)
+    return info
 
 
 async def api_card_offline(request):

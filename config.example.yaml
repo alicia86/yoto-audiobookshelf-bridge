@@ -27,6 +27,8 @@ yoto_client_id: "paste-yoto-client-id"
 # offline_whole_track_seconds: 0  # longest track of a whole-book/series offline copy in seconds (0 = just under 2 h,
                                   #   3300 keeps to Yoto's stated 60 min per track)
 # offline_max_mb: 0              # size limit for whole-book/series offline copies in MB (0 = none)
+# offline_parallel: 1            # offline copies made at once; more wait their turn (each one runs ffmpeg
+#                                # on the bridge's machine next to the cards streaming, and reads the whole book from ABS)
 # chapters_api_key: "key-of-an-ABS-user-who-may-edit-books"   # Chapters tab: needed if abs_api_key's user can't edit
 # audible_region: us            # Chapters tab: Audible store for chapter lists (us, uk, ca, au, de, fr, it, es, jp, in)
 # ui_pin: "4321"                # PIN for making/changing cards on the phone page
