@@ -95,7 +95,7 @@ async def test_library_mode_picks_a_yoto_icon_per_chapter(env, ai):
     br, client, _ = await env.make(chapter_tracks=True, ai_pictures=settings(ai))
     s = (await (await client.post("/api/cards", json={"item_id": "li1"})).json())["slot"]
     st = await (await client.get("/api/status")).json()
-    assert st["icons"]["ai"] == {"enabled": True, "mode": "library"}
+    assert st["icons"]["ai"]["enabled"] and st["icons"]["ai"]["mode"] == "library"
     r = await client.post(f"/api/cards/{s}/icon/ai", json={})
     assert r.status == 200
     job = await _wait(client, s)
@@ -168,3 +168,113 @@ def test_settings_reject_typos():
         AISettings.parse({"transcibe": {"url": "x"}})
     with pytest.raises(SystemExit):
         AISettings.parse({"image": {"url": "x", "api": "comfy"}})
+
+
+# ---------------- Claude draws the pixels ----------------
+
+import json  # noqa: E402
+
+DRAGON = {"subject": "a friendly green dragon", "palette": ["#3cb043", "#ffd23f"],
+          "rows": ["................"] * 4 + ["....00000000...."] * 8 + ["....11111111...."] * 4}
+
+
+class FakeClaude:
+    def __init__(self):
+        self.requests: list[dict] = []
+        self.answer = DRAGON
+        self.stop_reason = "end_turn"
+        self.status = 200
+
+    def app(self):
+        a = web.Application()
+
+        async def messages(r):
+            body = await r.json()
+            self.requests.append({"body": body, "headers": {k.lower(): v for k, v in r.headers.items()}, "query": dict(r.query)})
+            if self.status != 200:
+                return web.json_response({"type": "error", "error": {"type": "overloaded_error", "message": "busy"}},
+                                         status=self.status)
+            return web.json_response({
+                "id": "msg_1", "type": "message", "role": "assistant", "model": body["model"],
+                "content": [{"type": "text", "text": json.dumps(self.answer)}],
+                "stop_reason": self.stop_reason, "stop_sequence": None,
+                "usage": {"input_tokens": 10, "output_tokens": 10}})
+
+        a.router.add_post("/v1/messages", messages)
+        return a
+
+
+@pytest.fixture
+async def claude():
+    fake = FakeClaude()
+    srv = TestServer(fake.app())
+    await srv.start_server()
+    fake.url = str(srv.make_url("")).rstrip("/")
+    yield fake
+    await srv.close()
+
+
+async def test_claude_draws_each_chapter_from_the_book_and_chapter_titles(env, claude):
+    br, client, _ = await env.make(chapter_tracks=True, ai_pictures={"claude": {"key": "sk-test", "url": claude.url}})
+    s = (await (await client.post("/api/cards", json={"item_id": "li1"})).json())["slot"]
+    st = (await (await client.get("/api/status")).json())["icons"]["ai"]
+    assert st["mode"] == "claude" and st["claude"]["key_set"] and "sk-test" not in json.dumps(st)
+    await client.post(f"/api/cards/{s}/icon/ai", json={})
+    job = await _wait(client, s)
+    assert job["status"] == "done" and job["done"] == 3 and job["skipped"] == 0
+    px = br.custom_icon_path(br.store.get(s), "li1:2").read_bytes()
+    assert tuple(px[(5 * 16 + 6) * 4:(5 * 16 + 6) * 4 + 3]) == (0x3c, 0xb0, 0x43)   # the dragon's body
+    assert tuple(px[:3]) == (0, 0, 0)                                               # background is off
+    req = claude.requests[1]
+    assert req["headers"]["x-api-key"] == "sk-test"
+    assert req["body"]["model"] == "claude-opus-5-5" and req["body"]["fallbacks"] == "default"
+    assert req["body"]["output_config"]["format"]["type"] == "json_schema"
+    prompt = req["body"]["messages"][0]["content"]
+    assert 'Book: "Book li1" by Author' in prompt and 'Chapter 2 of 3: "Chapter 2"' in prompt
+    assert "kid-safe" in prompt
+
+
+async def test_claude_card_picture_and_refusal_and_unsafe(env, claude):
+    br, client, _ = await env.make(chapter_tracks=True, ai_pictures={"claude": {"key": "sk-test", "url": claude.url}})
+    s = (await (await client.post("/api/cards", json={"item_id": "li1"})).json())["slot"]
+    await client.post(f"/api/cards/{s}/icon/ai", json={"target": "card"})
+    job = await _wait(client, s)
+    assert job["status"] == "done" and br.store.get(s).icon_custom and br.store.get(s).icon_style == "custom"
+
+    claude.answer = {**DRAGON, "subject": "a sword"}
+    await client.post(f"/api/cards/{s}/icon/ai", json={})
+    assert (await _wait(client, s))["skipped"] == 3                  # never a weapon unless allowed
+    claude.stop_reason, claude.answer = "refusal", DRAGON
+    await client.post(f"/api/cards/{s}/icon/ai", json={})
+    assert (await _wait(client, s))["skipped"] == 3
+
+
+async def test_claude_key_from_the_page_and_overloaded_waits(env, claude):
+    br, client, _ = await env.make(chapter_tracks=True, ai_pictures={"claude": {"url": claude.url}})
+    s = (await (await client.post("/api/cards", json={"item_id": "li1"})).json())["slot"]
+    assert (await client.post(f"/api/cards/{s}/icon/ai", json={})).status == 400     # no key yet
+    r = await client.post("/api/ai/claude", json={"key": "sk-page-1234", "model": "claude-haiku-5-5"})
+    info = await r.json()
+    assert info["claude"]["key_hint"] == "…1234" and info["mode"] == "claude" and "sk-page" not in json.dumps(info)
+    saved = br.ai.key_file
+    assert json.loads(saved.read_text())["key"] == "sk-page-1234" and (saved.stat().st_mode & 0o077) == 0
+    br.ai.RETRY_SLEEP = 0.01
+    claude.status = 529
+    task = await client.post(f"/api/cards/{s}/icon/ai", json={})
+    assert task.status == 200
+    await asyncio.sleep(0.5)
+    claude.status = 200
+    job = await _wait(client, s)
+    assert job["status"] == "done" and job["done"] == 3
+    assert claude.requests[-1]["body"]["model"] == "claude-haiku-5-5" and "fallbacks" not in claude.requests[-1]["body"]
+    await client.post("/api/ai/claude", json={"key": ""})
+    assert not saved.exists() and (await (await client.get("/api/status")).json())["icons"]["ai"]["enabled"] is False
+
+
+def test_raster_tolerates_a_sloppy_grid():
+    from yotobridge.claude_pixels import raster
+    px = raster(["#ff0000", "nonsense"], ["0" * 20, "01x.", ""])
+    assert len(px) == 16 * 16 * 4
+    assert tuple(px[:3]) == (255, 0, 0) and tuple(px[16 * 4:16 * 4 + 3]) == (255, 0, 0)
+    assert tuple(px[(16 + 1) * 4:(16 + 1) * 4 + 3]) == (0, 0, 0)       # a bad colour is background
+    assert tuple(px[(2 * 16) * 4:(2 * 16) * 4 + 3]) == (0, 0, 0)       # missing rows too

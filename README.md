@@ -131,6 +131,17 @@ The bridge does none of the AI itself. It calls three services in the OpenAI API
 - Kid-safe: the text model is told to keep to kid-safe things, and a subject naming a weapon or anything gory is dropped (the chapter is left as it was), unless **Theme icons → Allow every icon**.
 - What leaves the bridge: up to `sample_seconds` of each chapter's audio goes to the transcribe service, and its text to the text service. Keep both at home if that matters to you.
 
+#### Claude draws the pictures (your own Anthropic API key)
+
+Optional: instead of the services above, Claude can draw each picture itself. Claude makes no images; it chooses every one of the 256 pixels and answers with a small palette and 16 rows of palette numbers, which the bridge turns into the icon. That suits a 16x16 screen better than shrinking a big picture.
+
+- **Set it up**: create an API key at console.anthropic.com (the pictures are billed to that account's API credits; a claude.ai subscription does not cover the API), then on the Cards tab paste it under **Claude pictures** and press **Save**. The page shows only its last four characters; the key is kept in `data/claude.json` (readable by the bridge only) and is never sent back to the page. **Remove** forgets it. Or set it in config.yaml under `ai_pictures.claude` (then the page cannot change it).
+- **Model**: Claude Opus 5.5 (default, best drawings), Sonnet 5.5 (half the price), Haiku 5.5 (far cheaper, simpler drawings). A rough guide, not a measured bill: Opus 5.5 costs a few US cents per picture, about a dollar for a 30-chapter book; Haiku 5.5 a small fraction of a cent.
+- **Use it**: **Icon → Pictures per chapter → Make AI pictures** draws every chapter of the card's current book; **Card picture** draws one picture for the whole card (saved as its custom picture).
+- **What Claude gets**: the book's title, author, series and description from Audiobookshelf, and the chapter's number and title. Claude draws from what it knows about the book; chapters only called "Chapter 7" of a little-known book get a picture of the book as a whole. With a `transcribe` service also set, the opening of each chapter's text is added, which helps those chapters.
+- Kid-safe as above: Claude is told to avoid weapons and scary things, a drawing it names as one is dropped, and a request Claude declines is skipped.
+- When Claude is overloaded or rate limited, the chapter waits and is tried again, like a sleeping computer above. A wrong key stops the job with a message on the card.
+
 
 - **Streaming cards** point their track at `<public_url>/s/icon/<slot>.png` (Yoto "dynamic icons", `display.iconUrl16x16`), which the bridge draws on request for the chapter being listened to, or the chapter ABS has the book at when the card is idle. Existing cards get the icon on the next bridge start. Whether the player re-fetches the icon while a track plays (so the number moves on mid-stream) is not documented; see [Unverified points](#unverified-points-and-what-each-test-result-changes).
 - **Offline copies** upload one icon per chapter (`display.icon16x16`), so each chapter track shows its number with no internet. This needs the **`user:icons:manage`** scope on your Yoto app (dashboard.yoto.dev → your app → Scopes), then **Connect Yoto** again on the bridge page so the new permission is granted. Without it, offline copies are made as before, just without icons, and the log says why. Icons are uploaded once per book chapter and reused.

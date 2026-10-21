@@ -49,6 +49,8 @@ yoto_client_id: "paste-yoto-client-id"
 #   # image: {url: http://192.168.1.30:11434, model: "<an Ollama image model>", api: ollama, unload: true}
 #   # or a hosted service: {url: https://api.example.com/v1, model: "<model>", key: "<api key>"}
 #   sample_seconds: 180          # how much of each chapter is listened to
+#   # Or Claude draws the pictures with your own Anthropic API key (also settable on the Cards tab):
+#   claude: {key: "<your Anthropic API key>", model: claude-opus-5-5}   # or claude-sonnet-5-5, claude-haiku-5-5
 
 # Per-player overrides. Device ids are printed in the bridge log at startup.
 # devices:

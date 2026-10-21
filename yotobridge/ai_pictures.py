@@ -24,12 +24,15 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import aiohttp
 
 from . import icons
+from .claude_pixels import MODELS, ClaudeArtist, ClaudeSettings, ClaudeUnavailable
 from .icon_themes import UNSAFE, words
 
 log = logging.getLogger(__name__)
@@ -75,6 +78,7 @@ class AISettings:
     transcribe: Endpoint = field(default_factory=Endpoint)
     text: Endpoint = field(default_factory=Endpoint)
     image: Endpoint = field(default_factory=Endpoint)
+    claude: ClaudeSettings = field(default_factory=ClaudeSettings)   # Claude draws the pixels itself
     sample_seconds: int = 180       # how much of each chapter is transcribed
     retry_minutes: float = 60       # how long a chapter waits for a service that cannot be reached
     timeout_seconds: float = 600    # one request (a slow computer drawing a picture takes a while)
@@ -82,7 +86,8 @@ class AISettings:
     @classmethod
     def parse(cls, raw) -> "AISettings":
         raw = dict(raw or {})
-        s = cls(**{k: Endpoint.parse(raw.pop(k, None)) for k in ("transcribe", "text", "image")})
+        s = cls(**{k: Endpoint.parse(raw.pop(k, None)) for k in ("transcribe", "text", "image")},
+                claude=ClaudeSettings.parse(raw.pop("claude", None)))
         for k in ("sample_seconds", "retry_minutes", "timeout_seconds"):
             if k in raw:
                 setattr(s, k, type(getattr(s, k))(raw.pop(k)))
@@ -92,11 +97,12 @@ class AISettings:
 
     @property
     def enabled(self) -> bool:
-        return bool(self.transcribe.url and self.text.url)
+        return bool(self.claude.key or (self.transcribe.url and self.text.url))
 
     @property
     def mode(self) -> str:
-        return "images" if self.image.url else "library"
+        """claude: Claude draws the pixels; images: an image service draws; library: a Yoto icon is picked."""
+        return "claude" if self.claude.key else "images" if self.image.url else "library"
 
 
 class Unreachable(Exception):
@@ -202,6 +208,16 @@ class AIPictures:
     def __init__(self, br, settings: AISettings):
         self.br, self.s = br, settings
         self.client = AIClient(br.http, settings)
+        self.key_file = Path(br.cfg.data_dir) / "claude.json"     # a key set on the page (config.yaml wins)
+        self.key_from_config = bool(settings.claude.key)
+        if not self.key_from_config and self.key_file.exists():
+            try:
+                saved = json.loads(self.key_file.read_text())
+                settings.claude.key = saved.get("key", "")
+                settings.claude.model = saved.get("model") or settings.claude.model
+            except (OSError, ValueError):
+                pass
+        self.claude = ClaudeArtist(settings.claude, settings.timeout_seconds)
         self.jobs: dict[str, dict] = {}        # slot -> progress, shown on the page
         self._tasks: dict[str, asyncio.Task] = {}
         self._lock = asyncio.Lock()            # one chapter at a time across all cards (one computer)
@@ -209,14 +225,43 @@ class AIPictures:
     def status(self, slot_id: str) -> dict | None:
         return self.jobs.get(slot_id)
 
-    def start(self, slot, overwrite: bool = False) -> dict:
+    def info(self) -> dict:
+        """For the page: what is set up (never the key itself)."""
+        c = self.s.claude
+        return {"enabled": self.s.enabled, "mode": self.s.mode, "transcribe": bool(self.s.transcribe.url),
+                "claude": {"key_set": bool(c.key), "key_hint": f"…{c.key[-4:]}" if c.key else "", "model": c.model,
+                           "from_config": self.key_from_config, "available": self.claude.available,
+                           "models": [{"id": k, "label": v} for k, v in MODELS.items()]}}
+
+    def set_claude(self, key: str | None, model: str | None):
+        """Key and model chosen on the page, kept in <data_dir>/claude.json (readable by the bridge only)."""
+        if self.key_from_config:
+            raise RuntimeError("The Claude key is set in config.yaml; change it there.")
+        c = self.s.claude
+        if key is not None:
+            c.key = key.strip()
+        if model:
+            if model not in MODELS:
+                raise RuntimeError("unknown Claude model")
+            c.model = model
+        if c.key:
+            self.key_file.parent.mkdir(parents=True, exist_ok=True)
+            self.key_file.touch(mode=0o600, exist_ok=True)
+            os.chmod(self.key_file, 0o600)
+            self.key_file.write_text(json.dumps({"key": c.key, "model": c.model}))
+        else:
+            self.key_file.unlink(missing_ok=True)
+
+    def start(self, slot, overwrite: bool = False, target: str = "chapters") -> dict:
+        """target "chapters": a picture per chapter of the card's book; "card": one picture for the card."""
         if not self.s.enabled:
-            raise RuntimeError("Set ai_pictures (transcribe and text) in config.yaml and restart the bridge first.")
+            raise RuntimeError("Add a Claude API key on the Cards tab, or set ai_pictures in config.yaml, first.")
         if slot.slot in self._tasks and not self._tasks[slot.slot].done():
             return self.jobs[slot.slot]
         self.jobs[slot.slot] = {"status": "running", "done": 0, "total": 0, "skipped": 0, "step": "starting",
-                                "error": "", "mode": self.s.mode, "item_id": slot.item_id}
-        self._tasks[slot.slot] = asyncio.create_task(self._run(slot, overwrite))
+                                "error": "", "mode": self.s.mode, "item_id": slot.item_id, "target": target}
+        run = self._run_card(slot) if target == "card" else self._run(slot, overwrite)
+        self._tasks[slot.slot] = asyncio.create_task(run)
         return self.jobs[slot.slot]
 
     def cancel(self, slot_id: str):
@@ -238,10 +283,13 @@ class AIPictures:
                 job.update(status="done", step="")
                 return
             key = self.br.cfg.abs_key_for(slot.device_id)
-            tracks = self.br.pm._tracks(await self.br.abs.item_tracks(item_id, key))
+            listen = bool(self.s.transcribe.url)          # with Claude, listening to the chapter is optional
+            tracks = self.br.pm._tracks(await self.br.abs.item_tracks(item_id, key)) if listen else []
+            book = await self._book_about(item_id, key)
             for n, c in todo:
                 job["step"] = f"chapter {n}: {c.get('title') or ''}".strip(": ")
-                px = await self._with_retry(job, lambda: self._chapter(item_id, tracks, key, c), n)
+                px = await self._with_retry(
+                    job, lambda: self._chapter(item_id, tracks, key, c, n, len(chapters), book), n)
                 if px:
                     self._save(slot, f"{item_id}:{n}", px)
                 else:
@@ -267,7 +315,7 @@ class AIPictures:
             try:
                 async with self._lock:
                     return await fn()
-            except Unreachable as e:
+            except (Unreachable, ClaudeUnavailable) as e:
                 if waited >= self.s.retry_minutes * 60:
                     raise RuntimeError(f"the AI service could not be reached for {self.s.retry_minutes:g} minutes ({e})")
                 job["step"] = f"chapter {n}: waiting for the AI service ({e})"
@@ -282,20 +330,84 @@ class AIPictures:
         slot.icon_style = "custom"
         self.br.store.save()
 
-    async def _chapter(self, item_id: str, tracks, key: str, chapter: dict) -> bytes | None:
+    async def _book_about(self, item_id: str, key: str) -> str:
+        """The book as Claude sees it: title, author, series and description (from Audiobookshelf)."""
+        try:
+            md = (await self.br.abs.item(item_id, key)).get("media", {}).get("metadata", {})
+        except Exception:
+            return ""
+        series = md.get("seriesName") or md.get("series") or ""
+        if isinstance(series, dict):
+            series = series.get("name", "")
+        elif isinstance(series, list):
+            series = ", ".join(x.get("name", "") for x in series if isinstance(x, dict))
+        desc = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", md.get("description") or "")).strip()[:1500]
+        lines = [f'Book: "{md.get("title") or ""}"' + (f' by {md["authorName"]}' if md.get("authorName") else "")]
+        if series:
+            lines.append(f"Series: {series}")
+        if desc:
+            lines.append(f"About the book: {desc}")
+        return "\n".join(lines)
+
+    async def _run_card(self, slot):
+        """One picture for the whole card, from the book (or the series, on a series card)."""
+        job = self.jobs[slot.slot]
+        job["total"] = 1
+        try:
+            key = self.br.cfg.abs_key_for(slot.device_id)
+            about = await self._book_about(slot.item_id, key)
+            if slot.series_id and slot.series_name:
+                about += f"\nThe picture stands for the whole series: {slot.series_name}"
+            job["step"] = "the card picture"
+            px = await self._with_retry(job, lambda: self._picture(about + "\n\nThis picture is for the whole book.", ""), 0)
+            if px:
+                path = self.br.custom_icon_path(slot)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(px)
+                slot.icon_custom = hashlib.sha1(px).hexdigest()[:8]
+                slot.icon_style = "custom"
+                self.br.store.save()
+                await self.br.apply_icon_style([slot])
+            else:
+                job["skipped"] = 1
+            job.update(status="done", done=1, step="")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            job.update(status="failed", error=str(e)[:300], step="")
+            log.warning("AI card picture for %s failed: %s", slot.title, e)
+
+    async def _chapter(self, item_id: str, tracks, key: str, chapter: dict, n: int = 0, total: int = 0,
+                       book: str = "") -> bytes | None:
         """16x16 RGBA for one chapter, or None when nothing kid-safe fits."""
-        start = float(chapter.get("start", 0))
-        end = float(chapter.get("end") or start + self.s.sample_seconds)
-        end = min(end, start + self.s.sample_seconds)
-        audio = bytearray()
-        async for chunk in self.br.encoder.stream(tracks, start, end, self.br.abs.auth_header(key)):
-            audio += chunk
-        said = await self.client.transcribe(await to_wav(bytes(audio)))
+        said = ""
+        if self.s.transcribe.url:
+            start = float(chapter.get("start", 0))
+            end = float(chapter.get("end") or start + self.s.sample_seconds)
+            end = min(end, start + self.s.sample_seconds)
+            audio = bytearray()
+            async for chunk in self.br.encoder.stream(tracks, start, end, self.br.abs.auth_header(key)):
+                audio += chunk
+            said = await self.client.transcribe(await to_wav(bytes(audio)))
         title = chapter.get("title") or ""
+        if self.s.mode == "claude":
+            about = (f"{book}\n" if book else "") + f'Chapter {n} of {total}: "{title}"'
+            if said:
+                about += f'\nThe chapter begins: "{said[:3000]}"'
+            return await self._picture(about, "")
         if not said and not title:
             return None
         about = f'Chapter title: "{title}"\nThe chapter begins: "{said[:3000]}"'
+        return await self._picture(about, said)
+
+    async def _picture(self, about: str, said: str) -> bytes | None:
         allow_all = self.br.store.state.icon_allow_all
+        if self.s.mode == "claude":
+            drawn = await self.claude.draw(about, allow_all)
+            if not drawn or (not allow_all and unsafe(drawn[0])):
+                return None
+            log.info("Claude drew: %s", drawn[0])
+            return drawn[1]
         if self.s.mode == "images":
             return await self._draw(about, allow_all)
         return await self._pick(about, allow_all)

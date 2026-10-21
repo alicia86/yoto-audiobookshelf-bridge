@@ -714,7 +714,7 @@ async def api_status(request):
         "icons": {"styles": [{"id": k, "label": v} for k, v in icons.STYLES.items()],
                   "style": br.store.state.icon_style or icons.DEFAULT_STYLE,
                   "allow_all": br.store.state.icon_allow_all, "enabled": br.cfg.chapter_icons,
-                  "ai": {"enabled": br.ai.s.enabled, "mode": br.ai.s.mode}}})
+                  "ai": br.ai.info()}})
 
 
 async def health(request):
@@ -1186,10 +1186,22 @@ async def api_card_ai_pictures(request):
         raise web.HTTPBadRequest(text="This card has no book.")
     body = await request.json() if request.can_read_body else {}
     try:
-        job = br.ai.start(slot, bool(body.get("overwrite")))
+        job = br.ai.start(slot, bool(body.get("overwrite")), "card" if body.get("target") == "card" else "chapters")
     except RuntimeError as e:
         raise web.HTTPBadRequest(text=str(e))
     return web.json_response(job)
+
+
+async def api_ai_claude(request):
+    """The owner's Claude API key and model for AI pictures; key "" removes it. The key is never sent back."""
+    require_pin(request)
+    br: Bridge = request.app[BRIDGE]
+    body = await request.json()
+    try:
+        br.ai.set_claude(body.get("key"), body.get("model"))
+    except RuntimeError as e:
+        raise web.HTTPBadRequest(text=str(e))
+    return web.json_response(br.ai.info())
 
 
 async def api_card_icon_preview(request):
@@ -1433,6 +1445,7 @@ def make_app(br: Bridge) -> web.Application:
     r.add_route("*", "/api/cards/{slot}/icon/chapters/{item}/{n}", api_card_chapter_icon)
     r.add_post("/api/icons", api_icon_defaults)
     r.add_post("/api/cards/{slot}/icon/ai", api_card_ai_pictures)
+    r.add_post("/api/ai/claude", api_ai_claude)
     r.add_delete("/api/cards/{slot}/icon/ai", api_card_ai_pictures)
     r.add_delete("/api/cards/{slot}", api_card_delete)
     chapter_api.register(app, br, require_pin)

@@ -32,7 +32,21 @@ export type IconSettings = {
   style: string // the default style
   allow_all: boolean // theme icons may be anything, not only kid-safe ones
   enabled: boolean // chapter_icons in config.yaml
-  ai?: { enabled: boolean; mode: "library" | "images" } // AI chapter pictures (ai_pictures in config.yaml)
+  ai?: AISettings // AI chapter pictures (a Claude key, or ai_pictures in config.yaml)
+}
+
+export type AISettings = {
+  enabled: boolean
+  mode: "library" | "images" | "claude"
+  transcribe: boolean // a transcribe service is set up (the chapter's opening is listened to)
+  claude: {
+    key_set: boolean
+    key_hint: string // last 4 characters only; the key never comes back to the page
+    model: string
+    from_config: boolean // set in config.yaml, not changeable here
+    available: boolean // the anthropic package is installed in the bridge
+    models: { id: string; label: string }[]
+  }
 }
 
 // A background job making AI pictures for a card's chapters
@@ -43,7 +57,8 @@ export type AIJob = {
   skipped: number
   step: string
   error: string
-  mode: "library" | "images"
+  mode: "library" | "images" | "claude"
+  target?: "chapters" | "card"
 }
 
 export type Book = {

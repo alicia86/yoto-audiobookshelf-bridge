@@ -1,14 +1,15 @@
 // Pixel icon styles: a sheet to pick a card's style (with previews of each, drawn by the bridge from
 // the chapter the card is at) and the default style for every card without its own.
-import { ArrowLeft, ImagePlus, ListOrdered, ShieldCheck, Sparkles, Square, Wand2, X } from "lucide-react"
+import { ArrowLeft, Bot, ImagePlus, ListOrdered, ShieldCheck, Sparkles, Square, Wand2, X } from "lucide-react"
 import { useEffect, useRef, useState } from "react"
 import { toast } from "sonner"
 
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { api, errorText } from "@/lib/api"
 import { cn } from "@/lib/utils"
-import type { AIJob, CardSlot, IconSettings } from "@/types"
+import type { AIJob, AISettings, CardSlot, IconSettings } from "@/types"
 
 const label = (s: IconSettings, id: string) => s.styles.find((x) => x.id === id)?.label ?? id
 
@@ -153,9 +154,9 @@ function ChapterPictures({ card, settings, onBack, onDone }: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [running, card.slot])
 
-  const startAI = async (overwrite: boolean) => {
+  const startAI = async (overwrite: boolean, target: "chapters" | "card" = "chapters") => {
     try {
-      setJob(await api<AIJob>(`/api/cards/${card.slot}/icon/ai`, { method: "POST", body: { overwrite } }))
+      setJob(await api<AIJob>(`/api/cards/${card.slot}/icon/ai`, { method: "POST", body: { overwrite, target } }))
     } catch (e) {
       toast.error(errorText(e))
     }
@@ -223,12 +224,17 @@ function ChapterPictures({ card, settings, onBack, onDone }: {
                   Redo all
                 </Button>
               )}
+              <Button size="sm" variant="ghost" disabled={busy} onClick={() => startAI(false, "card")}>
+                <Wand2 /> {card.icon_custom ? "New card picture" : "Card picture"}
+              </Button>
             </div>
           )}
           <p className="text-muted-foreground">
-            {settings.ai.mode === "images"
-              ? "Listens to the start of each chapter and draws a picture for it."
-              : "Listens to the start of each chapter and picks the best fitting icon from Yoto's library."}{" "}
+            {settings.ai.mode === "claude"
+              ? `Claude draws a 16x16 picture for each chapter from the book's description and the chapter's title${settings.ai.transcribe ? " and opening" : ""}. “Card picture” draws one for the whole card.`
+              : settings.ai.mode === "images"
+                ? "Listens to the start of each chapter and draws a picture for it."
+                : "Listens to the start of each chapter and picks the best fitting icon from Yoto's library."}{" "}
             {job?.status === "done" && job.skipped ? `${job.skipped} chapters had nothing kid-safe to show and were left as they were.` : ""}
           </p>
         </div>
@@ -354,7 +360,77 @@ export function IconDefaults({ settings, onChange }: { settings: IconSettings; o
           </SelectContent>
         </Select>
       </div>
+      {settings.ai && <ClaudeKey ai={settings.ai} onChange={(ai) => onChange({ ...settings, ai })} />}
       {!settings.enabled && <p className="text-xs text-muted-foreground">Icons are switched off in config.yaml (chapter_icons).</p>}
+    </div>
+  )
+}
+
+// Your own Claude API key: Claude then draws the AI chapter pictures (billed to your Anthropic account)
+function ClaudeKey({ ai, onChange }: { ai: AISettings; onChange: (ai: AISettings) => void }) {
+  const [key, setKey] = useState("")
+  const [busy, setBusy] = useState(false)
+  const c = ai.claude
+  const save = async (body: { key?: string; model?: string }, msg: string) => {
+    setBusy(true)
+    try {
+      onChange(await api<AISettings>("/api/ai/claude", { method: "POST", body }))
+      setKey("")
+      toast.success(msg)
+    } catch (e) {
+      toast.error(errorText(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+  if (!c.available) return null
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <span className="flex items-center gap-1.5 text-muted-foreground">
+          <Bot className="size-4" /> Claude pictures
+        </span>
+        {c.key_set ? (
+          <span className="flex items-center gap-1 text-xs text-muted-foreground">
+            key {c.key_hint}
+            {c.from_config ? (
+              " (config.yaml)"
+            ) : (
+              <Button size="sm" variant="ghost" className="h-7 px-2" disabled={busy} onClick={() => save({ key: "" }, "Claude key removed")}>
+                Remove
+              </Button>
+            )}
+          </span>
+        ) : (
+          <span className="text-xs text-muted-foreground">off</span>
+        )}
+      </div>
+      {!c.key_set && (
+        <div className="flex gap-1.5">
+          <Input type="password" autoComplete="off" placeholder="Claude API key (sk-ant-…)" value={key} onChange={(e) => setKey(e.target.value)} className="h-8" />
+          <Button size="sm" disabled={busy || !key.trim()} onClick={() => save({ key }, "Claude key saved")}>
+            Save
+          </Button>
+        </div>
+      )}
+      {c.key_set && !c.from_config && (
+        <Select value={c.model} onValueChange={(v) => save({ model: v }, "Claude model changed")}>
+          <SelectTrigger size="sm" className="h-8 gap-1 px-2" aria-label="Claude model for pictures">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {c.models.map((m) => (
+              <SelectItem key={m.id} value={m.id}>
+                {m.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      )}
+      <p className="text-xs text-muted-foreground">
+        With your own key from console.anthropic.com, Claude draws the AI chapter pictures (Icon → Pictures per chapter). Each picture is billed to your Anthropic
+        account. The key stays on the bridge.
+      </p>
     </div>
   )
 }

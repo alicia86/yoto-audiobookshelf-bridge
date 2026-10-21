@@ -1,3 +1,4 @@
 aiohttp==3.14.4
 pyyaml>=6.0
 yoto-api==4.5.1
+anthropic==1.15.0   # optional: Claude draws AI chapter pictures with the owner's own API key
