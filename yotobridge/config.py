@@ -82,6 +82,10 @@ class Config:
     # Push alerts when something breaks (see README "Alerts"). Empty ntfy_url = off.
     ntfy_url: str = ""                # e.g. https://ntfy.sh/<a-long-random-topic-name>
     ntfy_token: str = ""              # only for a protected topic on your own ntfy server
+    # Discord webhook alerts. Empty = off. Works alongside ntfy_url.
+    discord_webhook_url: str = ""     # https://discord.com/api/webhooks/<id>/<token>
+    discord_username: str = "Yoto Bridge"
+    discord_avatar_url: str = ""
     alert_check_minutes: float = 5
     alert_after_failures: int = 2     # checks in a row before alerting, so a quick ABS restart is ignored
     alert_check_public: bool = True   # also check that public_url reaches the bridge from outside
@@ -133,6 +137,8 @@ _ENV = {
     "LISTEN_PORT": "listen_port", "DATA_DIR": "data_dir", "YOTO_CLIENT_ID": "yoto_client_id",
     "YOTO_REDIRECT_URI": "yoto_redirect_uri", "RESUME_MODE": "resume_mode", "BITRATE_KBPS": "bitrate_kbps", "UI_PIN": "ui_pin",
     "NTFY_URL": "ntfy_url", "NTFY_TOKEN": "ntfy_token",
+    "DISCORD_WEBHOOK_URL": "discord_webhook_url", "DISCORD_USERNAME": "discord_username",
+    "DISCORD_AVATAR_URL": "discord_avatar_url",
 }
 
 
@@ -161,6 +167,7 @@ def load(path: str | None = None) -> Config:
     cfg.alert_check_minutes = float(cfg.alert_check_minutes)
     cfg.abs_url = cfg.abs_url.rstrip("/")
     cfg.public_url = cfg.public_url.rstrip("/")
+    cfg.discord_webhook_url = cfg.discord_webhook_url.strip().split("?")[0].rstrip("/")
     if cfg.resume_mode not in ("server", "seconds_in"):
         raise SystemExit("resume_mode must be 'server' or 'seconds_in'")
     return cfg

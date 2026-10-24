@@ -1,6 +1,7 @@
 import math
 import array
 import asyncio
+import json
 import subprocess
 import time
 
@@ -1198,6 +1199,108 @@ async def test_alert_test_button(env):
     br2, client2, _ = await env.make()
     r = await client2.post("/api/alerts/test")
     assert r.status == 400
+
+
+async def _discord(delete_status: int = 204):
+    """A fake Discord webhook that records posts and deletes."""
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+    posts, deletes, n = [], [], [0]
+
+    async def post(r):
+        n[0] += 1
+        posts.append({"wait": r.query.get("wait"), "json": await r.json()})
+        return web.json_response({"id": f"m{n[0]}"})
+
+    async def delete(r):
+        deletes.append(r.match_info["mid"])
+        return web.Response(status=delete_status)
+    a = web.Application()
+    a.router.add_post("/api/webhooks/1/tok", post)
+    a.router.add_delete("/api/webhooks/1/tok/messages/{mid}", delete)
+    srv = TestServer(a)
+    await srv.start_server()
+    return srv, posts, deletes
+
+
+async def test_discord_embed_and_history(env):
+    srv, posts, _ = await _discord()
+    try:
+        br, client, _ = await env.make(discord_webhook_url=str(srv.make_url("/api/webhooks/1/tok")),
+                                       alert_check_public=False)
+        r = await client.post("/api/alerts/test")
+        assert r.status == 200 and posts[0]["wait"] == "true"
+        e = posts[0]["json"]["embeds"][0]
+        assert posts[0]["json"]["username"] == "Yoto Bridge"
+        assert e["title"] == "\U0001f535 Yoto Bridge Alert: System Test" and e["color"] == 3447003
+        fields = {f["name"]: f["value"] for f in e["fields"]}
+        assert fields == {"Subsystem": "Yoto Bridge", "Severity": "INFO", "Status": "Test"}
+        assert all(f["inline"] for f in e["fields"]) and e["footer"]["text"] == "Yoto Bridge"
+        assert e["timestamp"].endswith("+00:00")
+        hist = json.loads(br.alerts.history_path.read_text())
+        assert [h["id"] for h in hist] == ["m1"]
+    finally:
+        await srv.close()
+
+
+async def test_discord_degraded_and_recovered(env):
+    srv, posts, _ = await _discord()
+    try:
+        br, client, _ = await env.make(discord_webhook_url=str(srv.make_url("/api/webhooks/1/tok")),
+                                       alert_after_failures=1, alert_check_public=False)
+        await br.connect_yoto()
+        good = br.abs.base
+        br.abs.base = "http://127.0.0.1:9"
+        await br.alerts.check_all()
+        e = posts[-1]["json"]["embeds"][0]
+        fields = {f["name"]: f["value"] for f in e["fields"]}
+        assert e["color"] == 16753920 and "Service Degraded" in e["title"]
+        assert fields["Subsystem"] == "Audiobookshelf" and fields["Trigger Count"] == "1"
+        br.abs.base = good
+        await br.alerts.check_all()
+        e = posts[-1]["json"]["embeds"][0]
+        assert e["color"] == 65280 and "Service Recovered" in e["title"]
+    finally:
+        await srv.close()
+
+
+async def test_discord_prunes_messages_older_than_48h(env):
+    srv, posts, deletes = await _discord()
+    try:
+        br, client, _ = await env.make(discord_webhook_url=str(srv.make_url("/api/webhooks/1/tok")))
+        now = time.time()
+        br.alerts.history_path.write_text(json.dumps([
+            {"id": "old", "timestamp": now - 172801}, {"id": "new", "timestamp": now - 3600}]))
+        assert await br.alerts.send("t", "m", event_type="test")
+        assert deletes == ["old"]
+        assert [h["id"] for h in json.loads(br.alerts.history_path.read_text())] == ["new", "m1"]
+    finally:
+        await srv.close()
+
+
+async def test_discord_failed_delete_is_retried(env):
+    srv, posts, deletes = await _discord(delete_status=500)
+    try:
+        br, client, _ = await env.make(discord_webhook_url=str(srv.make_url("/api/webhooks/1/tok")))
+        br.alerts.history_path.write_text(json.dumps([{"id": "old", "timestamp": 0}]))
+        await br.alerts.send("t", "m")
+        assert deletes == ["old"]
+        assert "old" in [h["id"] for h in json.loads(br.alerts.history_path.read_text())]
+    finally:
+        await srv.close()
+
+
+async def test_discord_and_ntfy_both_receive(env):
+    dsrv, posts, _ = await _discord()
+    nsrv, got = await _ntfy(env)
+    try:
+        br, client, _ = await env.make(discord_webhook_url=str(dsrv.make_url("/api/webhooks/1/tok")),
+                                       ntfy_url=str(nsrv.make_url("/t")))
+        assert await br.alerts.send("Yoto bridge test", "hello", event_type="test")
+        assert len(posts) == 1 and len(got) == 1 and got[0]["body"] == "hello"
+    finally:
+        await dsrv.close()
+        await nsrv.close()
 
 
 # ---------------------------------------------------------------- chapter icons

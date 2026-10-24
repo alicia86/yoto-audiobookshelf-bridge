@@ -43,7 +43,7 @@ async def main():
         sync_task = asyncio.create_task(br.pm.run())
         alert_task = asyncio.create_task(br.alerts.run())
         if not br.alerts.enabled:
-            log.info("Alerts are off (set ntfy_url in config.yaml to get a push when something breaks)")
+            log.info("Alerts are off (set ntfy_url or discord_webhook_url in config.yaml to get a push when something breaks)")
         stop = asyncio.Event()
         for sig in (signal.SIGTERM, signal.SIGINT):
             asyncio.get_running_loop().add_signal_handler(sig, stop.set)

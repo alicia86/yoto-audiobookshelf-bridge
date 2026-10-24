@@ -726,11 +726,11 @@ async def api_alert_test(request):
     require_pin(request)
     br: Bridge = request.app[BRIDGE]
     if not br.alerts.enabled:
-        raise web.HTTPBadRequest(text="Set ntfy_url in config.yaml and restart the bridge first.")
+        raise web.HTTPBadRequest(text="Set discord_webhook_url or ntfy_url in config.yaml and restart the bridge first.")
     ok = await br.alerts.send("Yoto bridge test", "Alerts from the Yoto bridge reach this phone.",
-                              priority="default", tags="bell")
+                              priority="default", tags="bell", event_type="test", subsystem="Yoto Bridge")
     if not ok:
-        raise web.HTTPBadGateway(text="ntfy did not accept the alert; see the bridge log.")
+        raise web.HTTPBadGateway(text="No alert destination accepted the test alert; see the bridge log.")
     await br.alerts.check_all()
     return web.json_response({"ok": True, "problems": br.alerts.problems})
 
