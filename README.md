@@ -242,6 +242,18 @@ Progress is saved to the ABS user whose key the bridge uses. If a child listens 
 
   "Make offline" copies from the position of the card's assigned player, or the default user.
 
+### How long a card takes to start
+
+Between a tap and sound, three things happen: the Yoto looks the card up in Yoto's cloud and asks for the audio (through your proxy or tunnel, if you use one); the bridge opens an ABS session and starts sending audio; the player fills its buffer and starts playing. Only the middle part is the bridge's.
+
+To make it short, the bridge keeps the first 30 seconds of every card (`warm_start_seconds`), from where ABS has the book, already encoded. A tap then gets audio at once, and the player's buffer fills at network speed while ffmpeg starts on the rest. The bridge re-checks ABS positions every 5 minutes (`warm_refresh_seconds`) and after every listening session; if the phone has moved the book since, the tap starts normally from the new position.
+
+The log shows where a slow start spends its time. Note the time you put the card in, then read:
+
+- `GET <card> from …`: the player asked for the audio. Time before this is the Yoto and Yoto's cloud (and any proxy or tunnel).
+- `<book>: first audio sent 0.12s after the request (warm start)`: the bridge's share.
+- `<book> playing on <player>, 2.3s after the player asked for the audio`: the rest is the player buffering.
+
 ### Security & External API Authentication
 
 The bridge includes dual-layer security tailored for both local web users and external automation clients (such as Home Assistant or the ESP32 broker):
@@ -261,18 +273,19 @@ The bridge includes dual-layer security tailored for both local web users and ex
 
 ### Extended Yoto Management Endpoints
 
-The bridge exposes management endpoints used by external brokers and dashboards:
+The bridge exposes management endpoints used by external brokers (such as the ESP32 broker), automations, and third-party dashboards. Protected endpoints accept `X-Api-Key`, `Authorization: Bearer <key>`, or `?apikey=<key>`:
 
-| Endpoint | Method | Description |
-|---|---|---|
-| `/api/status` | `GET` | Bridge health, active devices, now playing, and login state (public) |
-| `/api/yoto/library` | `GET` | User and family library playlists and cards (requires `family:library:view`) |
-| `/api/yoto/groups` | `GET` | Family card groups and collection tags |
-| `/api/yoto/card/{card_id}` | `GET` | Detailed card metadata, tracks, and display icons |
-| `/api/yoto/card/{card_id}` | `PUT` | Update MYO playlist track content and chapter structure |
-| `/api/yoto/icons/upload` | `POST` | Upload custom 16x16 PNG pixel display icons directly to Yoto's CDN |
-| `/api/yoto/volume` | `POST` | Adjust player volume directly (`{"device_id": "...", "volume": 12}`) |
-| `/api/security/regenerate-key` | `POST` | Regenerate the bridge API key and persist to config |
+| Endpoint | Method | Auth | Request / Payload | Description |
+|---|---|---|---|---|
+| `/api/status` | `GET` | Public | None | Bridge health, active Yoto devices, current playback state, speeds, alerts, and login status |
+| `/api/yoto/library` | `GET` | API Key | None | Returns user and family library playlists and cards (requires `family:library:view`) |
+| `/api/yoto/groups` | `GET` | API Key | None | Returns family card groups, playlist categories, and custom tags |
+| `/api/yoto/card/{card_id}` | `GET` | API Key | None | Detailed card metadata, chapter tracks, and 16×16 display icon URLs |
+| `/api/yoto/card/{card_id}` | `PUT` | API Key / PIN | `{"title": "...", "cover_url": "...", "chapters": [...]}` | Update MYO playlist track content, chapter titles, audio streams, and display icons |
+| `/api/yoto/icons/upload` | `POST` | API Key / PIN | `{"image_b64": "data:image/png;base64,...", "filename": "icon.png"}` or binary PNG bytes | Upload custom 16×16 pixel icons directly to Yoto's CDN, returning `icon_ref` (e.g. `yoto:#...`) |
+| `/api/yoto/volume` | `POST` | API Key / PIN | `{"device_id": "...", "volume": 12}` | Adjust physical player volume directly via active MQTT control connection |
+| `/api/security/regenerate-key` | `POST` | API Key | None | Generates a new 32-character hex API key, hot-reloads it in memory, and persists it to `config.yaml` |
+| `/api/alerts/test` | `POST` | API Key / PIN | None | Dispatches immediate test alert notifications via Discord Webhook and/or ntfy |
 
 
 
