@@ -32,6 +32,7 @@ yoto_client_id: "paste-yoto-client-id"
 # chapters_api_key: "key-of-an-ABS-user-who-may-edit-books"   # Chapters tab: needed if abs_api_key's user can't edit
 # audible_region: us            # Chapters tab: Audible store for chapter lists (us, uk, ca, au, de, fr, it, es, jp, in)
 # ui_pin: "4321"                # PIN for making/changing cards on the phone page
+# api_key: "32-char-hex-api-key" # Arr-style API key protecting /api/* endpoints for external clients/brokers (e.g. Home Assistant, ESP32 broker)
 # bitrate_kbps: 64              # mono 64 kbps MP3 is plenty for speech
 # rewind_seconds: 5             # back up this much on every resume
 # warm_start_seconds: 30        # first seconds of each card kept encoded for a fast start (0 = off)
