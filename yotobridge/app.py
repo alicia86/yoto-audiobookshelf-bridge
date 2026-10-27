@@ -1470,7 +1470,7 @@ async def errors(request, handler):
 @web.middleware
 async def api_auth(request, handler):
     """
-    Arr-style API key authentication middleware for Streaming Bridge.
+    Master API key authentication middleware for Streaming Bridge.
     Explicitly exempts public streaming routes (/s/*), callback, root, and static assets.
     Protects all /api/* management endpoints.
     """

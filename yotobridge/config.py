@@ -102,7 +102,7 @@ class Config:
 
     library_ids: list[str] = field(default_factory=list)  # empty = all book libraries the ABS user can see
     ui_pin: str = ""                  # optional PIN for the web page's card-admin actions
-    api_key: str = ""                 # Arr-style 32-character master API key for protecting /api/* endpoints
+    api_key: str = ""                 # 32-character master API key for protecting /api/* endpoints
     devices: dict[str, DeviceConfig] = field(default_factory=dict)  # Yoto deviceId -> settings
 
     @property
@@ -154,7 +154,7 @@ def load(path: str | None = None) -> Config:
         if os.environ.get(env):
             raw[key] = os.environ[env]
 
-    # Auto-generate Arr-style 32-character hex API key if missing
+    # Auto-generate 32-character hex API key if missing
     if not raw.get("api_key"):
         raw["api_key"] = secrets.token_hex(16)
         if cfg_path.exists():

@@ -258,7 +258,7 @@ The log shows where a slow start spends its time. Note the time you put the card
 
 The bridge includes dual-layer security tailored for both local web users and external automation clients (such as Home Assistant or the ESP32 broker):
 
-- **Arr-Style API Key (`api_key`)**:
+- **Master API Key (`api_key`)**:
   Protects all `/api/*` management endpoints against unauthorized external requests.
   - Set `api_key: "your-32-char-hex-key"` in `config.yaml` or pass via environment variable `API_KEY` / `BRIDGE_API_KEY`.
   - External callers can authenticate using either:
@@ -349,7 +349,7 @@ Things only a real player can answer that have not been confirmed yet. Each maps
 - **Yoto cloud is in the loop** for card lookup and MQTT. If Yoto's service is down, cards do not start, even though the audio comes from your server.
 - **Per-player ABS users** rely on the player's MQTT event naming the card (which it does), unless the phone page started it or `ip:` is set. If that event arrives late, the card starts as the default user and restarts on the right one. With one ABS user for all players this does not matter.
 - **One player per card at a time.** Two players playing the same card simultaneously share one session.
-- **Security:** the stream URLs have no login (the Yoto cannot send credentials) but use unguessable 12-character slots. If you publish the bridge, publish only `/s/`, never the whole bridge. All management endpoints under `/api/*` are protected by an Arr-style `api_key` (`X-Api-Key` or Bearer token) for external consumers and brokers, while the same-origin phone web interface is protected by `ui_pin` for card and playback changes. Do not expose unauthenticated management ports to the public internet.
+- **Security:** the stream URLs have no login (the Yoto cannot send credentials) but use unguessable 12-character slots. If you publish the bridge, publish only `/s/`, never the whole bridge. All management endpoints under `/api/*` are protected by a master API key (`X-Api-Key` or Bearer token) for external consumers and brokers, while the same-origin phone web interface is protected by `ui_pin` for card and playback changes. Do not expose unauthenticated management ports to the public internet.
 - **Transcoding:** every stream is re-encoded to 64 kbps mono MP3 with ffmpeg. Measured on a desktop CPU: 10 minutes of AAC took 4 s of CPU, i.e. under 1 % of one core per playing Yoto; a low-power server CPU will be a few times that.
 
 ## Development
