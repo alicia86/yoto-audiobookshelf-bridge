@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
+import secrets
 import html
 import shutil
 import logging
@@ -1434,8 +1436,66 @@ async def errors(request, handler):
         return web.json_response({"error": str(e)}, status=500)
 
 
+@web.middleware
+async def api_auth(request, handler):
+    """
+    Arr-style API key authentication middleware for Streaming Bridge.
+    Explicitly exempts public streaming routes (/s/*), callback, root, and static assets.
+    Protects all /api/* management endpoints.
+    """
+    path = request.path
+    # 1. Exempt public streaming routes and browser assets
+    if path.startswith("/s/") or path == CALLBACK_PATH or path == "/" or path.startswith("/static/"):
+        return await handler(request)
+
+    # 2. Check if API key is enforced
+    br: Bridge = request.app.get(BRIDGE)
+    if not br or not br.cfg.api_key:
+        return await handler(request)
+
+    expected_key = br.cfg.api_key.strip()
+    provided_key = request.headers.get("X-Api-Key") or request.headers.get("X-API-KEY")
+
+    if not provided_key:
+        auth_hdr = request.headers.get("Authorization", "")
+        if auth_hdr.startswith("Bearer "):
+            provided_key = auth_hdr[7:].strip()
+
+    if not provided_key and request.method == "GET":
+        provided_key = request.query.get("apikey") or request.query.get("api_key")
+
+    if not provided_key or not hmac.compare_digest(provided_key.strip(), expected_key):
+        return web.json_response({"error": "Unauthorized", "message": "Valid Bridge X-Api-Key required."}, status=401)
+
+    return await handler(request)
+
+
+async def api_security_regenerate_key(request):
+    """Regenerates the Bridge 32-character hex API key, saves to config.yaml, and hot-reloads."""
+    br: Bridge = request.app[BRIDGE]
+    new_key = secrets.token_hex(16)
+    br.cfg.api_key = new_key
+
+    # Save to config.yaml
+    cfg_path = Path(os.environ.get("BRIDGE_CONFIG", "/data/config.yaml"))
+    if cfg_path.exists():
+        try:
+            import yaml
+            data = yaml.safe_load(cfg_path.read_text()) or {}
+            data["api_key"] = new_key
+            cfg_path.write_text(yaml.safe_dump(data, sort_keys=False))
+        except Exception as e:
+            log.warning("Could not persist new bridge api_key to %s: %s", cfg_path, e)
+
+    return web.json_response({
+        "status": "success",
+        "new_api_key": new_key,
+        "message": "Bridge API key updated successfully."
+    })
+
+
 def make_app(br: Bridge) -> web.Application:
-    app = web.Application(middlewares=[errors])
+    app = web.Application(middlewares=[errors, api_auth])
     app[BRIDGE] = br
     r = app.router
     r.add_get(CALLBACK_PATH, yoto_callback)
@@ -1452,6 +1512,7 @@ def make_app(br: Bridge) -> web.Application:
     if STATIC.is_dir():                 # built from web/ (see Dockerfile); absent in a bare checkout
         r.add_static("/static", STATIC)
     r.add_get("/api/status", api_status)
+    r.add_post("/api/security/regenerate-key", api_security_regenerate_key)
     r.add_post("/api/yoto/login", api_yoto_login)
     r.add_post("/api/yoto/finish", api_yoto_finish)
     r.add_get("/api/yoto/playlists", api_yoto_playlists)
@@ -1490,3 +1551,4 @@ def make_app(br: Bridge) -> web.Application:
     chapter_api.register(app, br, require_pin)
     transfer.register(app, br, require_pin, _point_card)
     return app
+

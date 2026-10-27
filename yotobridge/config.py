@@ -102,6 +102,7 @@ class Config:
 
     library_ids: list[str] = field(default_factory=list)  # empty = all book libraries the ABS user can see
     ui_pin: str = ""                  # optional PIN for the web page's card-admin actions
+    api_key: str = ""                 # Arr-style 32-character master API key for protecting /api/* endpoints
     devices: dict[str, DeviceConfig] = field(default_factory=dict)  # Yoto deviceId -> settings
 
     @property
@@ -136,6 +137,7 @@ _ENV = {
     "ABS_URL": "abs_url", "ABS_API_KEY": "abs_api_key", "PUBLIC_URL": "public_url",
     "LISTEN_PORT": "listen_port", "DATA_DIR": "data_dir", "YOTO_CLIENT_ID": "yoto_client_id",
     "YOTO_REDIRECT_URI": "yoto_redirect_uri", "RESUME_MODE": "resume_mode", "BITRATE_KBPS": "bitrate_kbps", "UI_PIN": "ui_pin",
+    "API_KEY": "api_key", "BRIDGE_API_KEY": "api_key",
     "NTFY_URL": "ntfy_url", "NTFY_TOKEN": "ntfy_token",
     "DISCORD_WEBHOOK_URL": "discord_webhook_url", "DISCORD_USERNAME": "discord_username",
     "DISCORD_AVATAR_URL": "discord_avatar_url",
@@ -143,13 +145,28 @@ _ENV = {
 
 
 def load(path: str | None = None) -> Config:
-    path = path or os.environ.get("BRIDGE_CONFIG", "/data/config.yaml")
+    import secrets
+    cfg_path = Path(path or os.environ.get("BRIDGE_CONFIG", "/data/config.yaml"))
     raw: dict = {}
-    if Path(path).exists():
-        raw = yaml.safe_load(Path(path).read_text()) or {}
+    if cfg_path.exists():
+        raw = yaml.safe_load(cfg_path.read_text()) or {}
     for env, key in _ENV.items():
         if os.environ.get(env):
             raw[key] = os.environ[env]
+
+    # Auto-generate Arr-style 32-character hex API key if missing
+    if not raw.get("api_key"):
+        raw["api_key"] = secrets.token_hex(16)
+        if cfg_path.exists():
+            try:
+                # Write newly generated api_key back to config.yaml safely
+                cfg_yaml_dict = yaml.safe_load(cfg_path.read_text()) or {}
+                if not cfg_yaml_dict.get("api_key"):
+                    cfg_yaml_dict["api_key"] = raw["api_key"]
+                    cfg_path.write_text(yaml.safe_dump(cfg_yaml_dict, sort_keys=False))
+            except Exception:
+                pass
+
     devices = {k: DeviceConfig(**(v or {})) for k, v in (raw.pop("devices", None) or {}).items()}
     known = Config.__dataclass_fields__
     unknown = set(raw) - set(known)
