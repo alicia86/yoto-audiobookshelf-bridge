@@ -18,6 +18,57 @@ import { TransferSheet } from "@/views/transfer"
 
 type Playlist = { cardId: string; title: string; bridge?: boolean }
 
+function AlertDestinations({ alerts }: { alerts?: Status["alerts"] }) {
+  const [testing, setTesting] = useState<string | null>(null)
+  if (!alerts) return null
+
+  const isObj = typeof alerts === "object"
+  const hasDiscord = isObj ? alerts.discord : false
+  const hasNtfy = isObj ? alerts.ntfy : Boolean(alerts)
+
+  if (!hasDiscord && !hasNtfy) return null
+
+  const testAlert = async (target: "discord" | "ntfy") => {
+    setTesting(target)
+    try {
+      await api("/api/alerts/test", { method: "POST", body: { target } })
+      toast.success(`Test alert sent to ${target === "discord" ? "Discord" : "ntfy"}!`)
+    } catch (e) {
+      toast.error(errorText(e))
+    } finally {
+      setTesting(null)
+    }
+  }
+
+  return (
+    <div className="mt-2 flex flex-wrap items-center justify-between gap-2 border-t pt-3 text-sm text-muted-foreground">
+      <span>Alert Notifications</span>
+      <div className="flex items-center gap-2">
+        {hasDiscord && (
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={testing !== null}
+            onClick={() => testAlert("discord")}
+          >
+            {testing === "discord" ? "Sending…" : "🔔 Test Discord"}
+          </Button>
+        )}
+        {hasNtfy && (
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={testing !== null}
+            onClick={() => testAlert("ntfy")}
+          >
+            {testing === "ntfy" ? "Sending…" : "📢 Test ntfy"}
+          </Button>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function YotoAccount() {
   const reconnect = async () => {
     try {
@@ -38,6 +89,7 @@ function YotoAccount() {
   )
 }
 
+
 export function CardsView(props: {
   pickBook: (label: string) => Promise<Picked | null>
   newCard: (c: Choice) => void
@@ -48,11 +100,16 @@ export function CardsView(props: {
   const [cards, setCards] = useState<CardSlot[] | null>(null)
   const [error, setError] = useState("")
   const [iconSettings, setIconSettings] = useState<IconSettings | null>(null)
+  const [alerts, setAlerts] = useState<Status["alerts"] | undefined>(undefined)
   useEffect(() => {
     api<Status>("/api/status")
-      .then((s) => setIconSettings(s.icons ?? null))
+      .then((s) => {
+        setIconSettings(s.icons ?? null)
+        setAlerts(s.alerts)
+      })
       .catch(() => {})
   }, [])
+
   const timer = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const load = useCallback(async () => {
@@ -328,10 +385,12 @@ export function CardsView(props: {
         ))
       )}
       {iconSettings && <IconDefaults settings={iconSettings} onChange={setIconSettings} />}
+      <AlertDestinations alerts={alerts} />
       <YotoAccount />
     </div>
   )
 }
+
 
 type OfflineMode = "next" | "book" | "series"
 

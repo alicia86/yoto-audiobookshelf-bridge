@@ -22,9 +22,11 @@ export type Status = {
   resume_mode: string
   error: string
   problems?: string[]
+  alerts?: boolean | { enabled: boolean; discord: boolean; ntfy: boolean }
   icon_upload_error?: string
   icons?: IconSettings
 }
+
 
 // Pixel icons on the Yoto's display: the default style, and the styles a card can have
 export type IconSettings = {

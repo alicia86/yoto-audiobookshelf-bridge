@@ -729,7 +729,12 @@ async def api_status(request):
         "yoto_logged_in": br.auth.logged_in, "yoto_client_id_set": bool(br.cfg.yoto_client_id),
         "login_pending": br.auth.pending if br.auth.pending and br.auth.pending["expires_at"] > time.time() else None, "mqtt": br.control.connected, "devices": devices,
         "pin_required": bool(br.cfg.ui_pin), "icon_upload_error": br.icon_upload_error, "resume_mode": br.cfg.resume_mode, "error": br.last_error, "speeds": list(SPEEDS),
-        "problems": br.alerts.problems, "alerts": br.alerts.enabled,
+        "problems": br.alerts.problems,
+        "alerts": {
+            "enabled": br.alerts.enabled,
+            "discord": bool(br.cfg.discord_webhook_url),
+            "ntfy": bool(br.cfg.ntfy_url)
+        },
         "icons": {"styles": [{"id": k, "label": v} for k, v in icons.STYLES.items()],
                   "style": br.store.state.icon_style or icons.DEFAULT_STYLE,
                   "allow_all": br.store.state.icon_allow_all, "enabled": br.cfg.chapter_icons,
@@ -744,14 +749,32 @@ async def health(request):
 async def api_alert_test(request):
     require_pin(request)
     br: Bridge = request.app[BRIDGE]
+    target = None
+    if request.can_read_body:
+        try:
+            body = await request.json()
+            target = body.get("target")
+        except Exception:
+            pass
+    if not target:
+        target = request.query.get("target")
+
+    if target == "discord" and not br.cfg.discord_webhook_url:
+        raise web.HTTPBadRequest(text="discord_webhook_url is not configured in config.yaml.")
+    if target == "ntfy" and not br.cfg.ntfy_url:
+        raise web.HTTPBadRequest(text="ntfy_url is not configured in config.yaml.")
     if not br.alerts.enabled:
         raise web.HTTPBadRequest(text="Set discord_webhook_url or ntfy_url in config.yaml and restart the bridge first.")
-    ok = await br.alerts.send("Yoto bridge test", "Alerts from the Yoto bridge reach this phone.",
-                              priority="default", tags="bell", event_type="test", subsystem="Yoto Bridge")
+
+    target_label = "Discord" if target == "discord" else ("ntfy" if target == "ntfy" else "alert destination")
+    ok = await br.alerts.send("Yoto bridge test", f"Test alert from Yoto Bridge ({target_label}).",
+                              priority="default", tags="bell", event_type="test", subsystem="Yoto Bridge",
+                              target=target)
     if not ok:
-        raise web.HTTPBadGateway(text="No alert destination accepted the test alert; see the bridge log.")
+        raise web.HTTPBadGateway(text=f"Failed to send test alert to {target_label}; see the bridge log.")
     await br.alerts.check_all()
-    return web.json_response({"ok": True, "problems": br.alerts.problems})
+    return web.json_response({"ok": True, "target": target or "all", "problems": br.alerts.problems})
+
 
 
 async def api_yoto_login(request):

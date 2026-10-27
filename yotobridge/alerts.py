@@ -77,21 +77,24 @@ class Alerts:
 
     async def send(self, title: str, message: str, priority: str = "high", tags: str = "warning", *,
                    event_type: str = "degraded", subsystem: str = "Yoto Bridge",
-                   trigger_count: int | None = None) -> bool:
-        """Send to every configured destination. True if at least one accepted the alert."""
+                   trigger_count: int | None = None, target: str | None = None) -> bool:
+        """Send to configured destinations. If target is 'discord' or 'ntfy', only send to that service."""
         if not self.enabled:
             log.info("alert (no ntfy_url or discord_webhook_url set, not sent): %s: %s", title, message)
             return False
         jobs = []
-        if self.cfg.discord_webhook_url:
+        if (target is None or target == "discord") and self.cfg.discord_webhook_url:
             jobs.append(self._send_discord(title, message, priority, tags, event_type, subsystem, trigger_count))
-        if self.cfg.ntfy_url:
+        if (target is None or target == "ntfy") and self.cfg.ntfy_url:
             jobs.append(self._send_ntfy(title, message, priority, tags))
+        if not jobs:
+            return False
         results = await asyncio.gather(*jobs, return_exceptions=True)
         ok = any(r is True for r in results)
         if ok:
             log.info("alert sent: %s: %s", title, message)
         return ok
+
 
     async def _send_ntfy(self, title: str, message: str, priority: str, tags: str) -> bool:
         headers = {"Title": title, "Priority": priority, "Tags": tags}
