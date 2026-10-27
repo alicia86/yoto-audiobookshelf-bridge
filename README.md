@@ -157,6 +157,31 @@ Optional: instead of the services above, Claude can draw each picture itself. Cl
 - **Streaming cards** point their track at `<public_url>/s/icon/<slot>.png` (Yoto "dynamic icons", `display.iconUrl16x16`), which the bridge draws on request for the chapter being listened to, or the chapter ABS has the book at when the card is idle. Existing cards get the icon on the next bridge start. Whether the player re-fetches the icon while a track plays (so the number moves on mid-stream) is not documented; see [Unverified points](#unverified-points-and-what-each-test-result-changes).
 - **Offline copies** upload one icon per chapter (`display.icon16x16`), so each chapter track shows its number with no internet. This needs the **`user:icons:manage`** scope on your Yoto app (dashboard.yoto.dev → your app → Scopes), then **Connect Yoto** again on the bridge page so the new permission is granted. Without it, offline copies are made as before, just without icons, and the log says why. Icons are uploaded once per book chapter and reused.
 
+### Per-Item Chapter Artwork Cache & External Broker Integration
+
+The bridge caches 16x16 chapter icons on a **per-item basis** in `data/icons/items/<item_id>/<chapter_num>.rgba` (and tracks them in `state.json` under `item_icons`).
+
+- **Universal inheritance:** When artwork is curated for an Audiobookshelf book item, any card that plays that book—whether a dedicated MYO card, a reused card, an offline copy, or a card stepping through a series—automatically inherits the curated chapter icons without needing to re-upload or customize each slot separately.
+- **Precedence hierarchy:**
+  1. Slot-level custom chapter icon (`data/icons/<slot>/<item_id>-<n>.rgba`)
+  2. Item-level custom chapter icon (`data/icons/items/<item_id>/<n>.rgba`)
+  3. Card-level custom picture
+  4. Selected artwork style (Cover, Progress bar, Theme icons, Creatures, or Default)
+- **External Broker REST Endpoints:** External services (such as the Yoto ESP32 Middleware Broker) or scripts can manage the item-level cache directly using an API key (`X-Api-Key` or Bearer token):
+  - `GET /api/items/{item_id}/icon/chapters/{n}`: Returns the 16x16 PNG for chapter `n` (1-indexed).
+  - `PUT /api/items/{item_id}/icon/chapters/{n}`: Uploads a 16x16 PNG (accepts raw image bytes with `Content-Type: image/png` or JSON `{"image_b64": "<base64>"}`).
+  - `DELETE /api/items/{item_id}/icon/chapters/{n}`: Removes the custom chapter icon.
+  - `POST /api/items/{item_id}/icon/chapters/batch`: Uploads icons for multiple chapters in a single atomic call:
+    ```json
+    {
+      "tracks": {
+        "1": "<base64-png>",
+        "2": "<base64-png>"
+      }
+    }
+    ```
+
+
 ### Series and collection cards
 
 A card can follow a whole ABS series or collection instead of one book. When you pick a book for a card (New card, Reuse a MYO card, Change book) and that book belongs to a series or a collection, the page asks **The whole series: …**, **The whole collection: …** or **Just this book**; a book's sheet in the Library also offers **Make a card for the whole series/collection**.

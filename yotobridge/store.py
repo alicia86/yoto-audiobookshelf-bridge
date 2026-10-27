@@ -44,6 +44,7 @@ class Slot:
 class State:
     slots: dict[str, Slot] = field(default_factory=dict)
     icons: dict[str, str] = field(default_factory=dict)   # "<item>:<chapter>" -> uploaded Yoto icon ("yoto:#…")
+    item_icons: dict[str, dict[str, str]] = field(default_factory=dict)  # "<item_id>" -> {"<chapter_num>": "<hash>"}
     speeds: dict[str, float] = field(default_factory=dict)  # Yoto deviceId -> playback speed (absent = 1.0)
     icon_style: str = ""           # default pixel icon style of every card ("" = icons.DEFAULT_STYLE)
     icon_allow_all: bool = False   # chapter theme icons: also pick weapons and other not-for-kids icons
@@ -57,14 +58,19 @@ class Store:
             raw = json.loads(self.path.read_text())
             self.state.slots = {k: Slot(**v) for k, v in raw.get("slots", {}).items()}
             self.state.icons = raw.get("icons", {})
+            self.state.item_icons = raw.get("item_icons", {})
             self.state.speeds = raw.get("speeds", {})
             self.state.icon_style = raw.get("icon_style", "")
             self.state.icon_allow_all = bool(raw.get("icon_allow_all", False))
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        data = {"slots": {k: asdict(v) for k, v in self.state.slots.items()}, "icons": self.state.icons, "speeds": self.state.speeds,
-                "icon_style": self.state.icon_style, "icon_allow_all": self.state.icon_allow_all}
+        data = {"slots": {k: asdict(v) for k, v in self.state.slots.items()},
+                "icons": self.state.icons,
+                "item_icons": self.state.item_icons,
+                "speeds": self.state.speeds,
+                "icon_style": self.state.icon_style,
+                "icon_allow_all": self.state.icon_allow_all}
         fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".state")
         with os.fdopen(fd, "w") as f:
             json.dump(data, f, indent=2)

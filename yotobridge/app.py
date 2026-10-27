@@ -124,6 +124,11 @@ class Bridge:
         base = self._icon_base(slot)
         return f"{base}/{slot.slot}/{layout_id}/{k}.png" if base else None
 
+    def item_icon_path(self, item_id: str, number: int) -> Path:
+        """Item-level chapter artwork cache (<data_dir>/icons/items/<item_id>/<n>.rgba)."""
+        d = Path(self.cfg.data_dir) / "icons" / "items" / item_id
+        return d / f"{number}.rgba"
+
     def custom_icon_path(self, slot, chapter_key: str = "") -> Path:
         """The card's own picture, or (chapter_key "<item>:<n>") the picture of one chapter."""
         d = Path(self.cfg.data_dir) / "icons"
@@ -135,11 +140,23 @@ class Bridge:
         return style if style in icons.STYLES and style not in ("custom", "none") else icons.DEFAULT_STYLE
 
     def custom_picture(self, slot, item_id: str, number: int | None) -> tuple[str, Path] | None:
-        """(hash, file) of the picture a custom card shows for a chapter: the chapter's own, else the card's."""
+        """(hash, file) of the picture a custom card shows for a chapter:
+        1. Chapter's slot-specific custom picture (if explicitly customized on the card)
+        2. Item-level custom chapter picture (cached per book across all cards/players)
+        3. Card's own default picture
+        """
         key = f"{item_id}:{number}"
-        if number and key in slot.icon_chapters:
+        if slot and number and key in slot.icon_chapters:
             return slot.icon_chapters[key], self.custom_icon_path(slot, key)
-        if slot.icon_custom:
+        # Check global item-level cache
+        if number and item_id:
+            ch_str = str(number)
+            item_map = self.store.state.item_icons.get(item_id, {})
+            if ch_str in item_map:
+                p = self.item_icon_path(item_id, number)
+                if p.exists():
+                    return item_map[ch_str], p
+        if slot and slot.icon_custom:
             return slot.icon_custom, self.custom_icon_path(slot)
         return None
 
@@ -1129,9 +1146,13 @@ async def api_card_chapter_icons(request):
     chapters = await br.chapters(slot.item_id)
     if len(chapters) < 2:
         return web.json_response([])
-    return web.json_response([{"item_id": slot.item_id, "number": n, "title": c.get("title") or f"Chapter {n}",
-                               "picture": slot.icon_chapters.get(f"{slot.item_id}:{n}", "")}
-                              for n, c in enumerate(chapters, 1)])
+    item_map = br.store.state.item_icons.get(slot.item_id, {})
+    return web.json_response([{
+        "item_id": slot.item_id,
+        "number": n,
+        "title": c.get("title") or f"Chapter {n}",
+        "picture": slot.icon_chapters.get(f"{slot.item_id}:{n}") or item_map.get(str(n), "")
+    } for n, c in enumerate(chapters, 1)])
 
 
 def _chapter_key(br, slot, request) -> str:
@@ -1153,23 +1174,43 @@ async def api_card_chapter_icon(request):
     if request.method not in ("GET", "PUT", "DELETE"):
         raise web.HTTPMethodNotAllowed(request.method, ["GET", "PUT", "DELETE"])
     key = _chapter_key(br, slot, request)
+    item_id, n_str = key.split(":", 1)
+    n = int(n_str)
     path = br.custom_icon_path(slot, key)
+    item_path = br.item_icon_path(item_id, n)
+
     if request.method == "GET":
-        if key not in slot.icon_chapters or not path.exists():
-            raise web.HTTPNotFound()
-        return web.Response(body=icons.png(path.read_bytes()), content_type="image/png", headers={"Cache-Control": "no-cache"})
+        # Check slot path first, then fallback to item path
+        if path.exists():
+            return web.Response(body=icons.png(path.read_bytes()), content_type="image/png", headers={"Cache-Control": "no-cache"})
+        if item_path.exists():
+            return web.Response(body=icons.png(item_path.read_bytes()), content_type="image/png", headers={"Cache-Control": "no-cache"})
+        raise web.HTTPNotFound()
+
     require_pin(request)
     if request.method == "DELETE":
         slot.icon_chapters.pop(key, None)
         path.unlink(missing_ok=True)
+        # Also clean from item-level cache if matching
+        if item_id in br.store.state.item_icons:
+            br.store.state.item_icons[item_id].pop(str(n), None)
+            item_path.unlink(missing_ok=True)
     else:
         px = await icons.shrink_cover(await request.read())
         if not px:
             raise web.HTTPBadRequest(text="That picture could not be read.")
+        # Save slot-level
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(px)
-        slot.icon_chapters[key] = hashlib.sha1(px).hexdigest()[:8]
+        icon_hash = hashlib.sha1(px).hexdigest()[:8]
+        slot.icon_chapters[key] = icon_hash
         slot.icon_style = "custom"
+
+        # Also save to item-level cache
+        item_path.parent.mkdir(parents=True, exist_ok=True)
+        item_path.write_bytes(px)
+        br.store.state.item_icons.setdefault(item_id, {})[str(n)] = icon_hash
+
     br.store.save()
     await br.apply_icon_style([slot])
     return web.json_response({"ok": True, "icon_style": slot.icon_style, "playing": slot.slot in br.pm.by_slot})
@@ -1446,6 +1487,109 @@ async def api_device_volume(request):
     return web.json_response({"ok": False, "error": "Control connection not connected"}, status=503)
 
 
+# ----------------------------------------------------------------------------
+# Item-Level Artwork Cache Endpoints
+# ----------------------------------------------------------------------------
+
+async def api_item_chapter_icon(request):
+    """
+    GET: /api/items/{item_id}/icon/chapters/{n} -> returns cached 16x16 PNG for item chapter n
+    PUT: /api/items/{item_id}/icon/chapters/{n} -> saves 16x16 icon to item cache
+    DELETE: /api/items/{item_id}/icon/chapters/{n} -> deletes item chapter icon
+    """
+    br: Bridge = request.app[BRIDGE]
+    item_id = request.match_info["item_id"]
+    try:
+        n = int(request.match_info["n"])
+    except ValueError:
+        raise web.HTTPBadRequest(text="Invalid chapter number")
+
+    item_path = br.item_icon_path(item_id, n)
+
+    if request.method == "GET":
+        if not item_path.exists():
+            raise web.HTTPNotFound()
+        return web.Response(body=icons.png(item_path.read_bytes()), content_type="image/png", headers={"Cache-Control": "no-cache"})
+
+    require_pin(request)
+    if request.method == "DELETE":
+        if item_id in br.store.state.item_icons:
+            br.store.state.item_icons[item_id].pop(str(n), None)
+        item_path.unlink(missing_ok=True)
+        br.store.save()
+        return web.json_response({"ok": True})
+
+    # PUT: accept raw bytes or base64 JSON
+    if request.content_type.startswith("application/json"):
+        body = await request.json()
+        import base64
+        b64 = body.get("image_b64") or body.get("png_b64")
+        if not b64:
+            raise web.HTTPBadRequest(text="image_b64 required")
+        raw_bytes = base64.b64decode(b64.split(",")[-1])
+    else:
+        raw_bytes = await request.read()
+
+    px = await icons.shrink_cover(raw_bytes)
+    if not px:
+        raise web.HTTPBadRequest(text="That picture could not be read.")
+
+    item_path.parent.mkdir(parents=True, exist_ok=True)
+    item_path.write_bytes(px)
+    icon_hash = hashlib.sha1(px).hexdigest()[:8]
+    br.store.state.item_icons.setdefault(item_id, {})[str(n)] = icon_hash
+    br.store.save()
+
+    # Hot-reload any active slots pointing at this item
+    affected = [s for s in br.store.state.slots.values() if s.item_id == item_id]
+    if affected:
+        await br.apply_icon_style(affected)
+
+    return web.json_response({"ok": True, "item_id": item_id, "chapter": n, "hash": icon_hash})
+
+
+async def api_item_chapter_icons_batch(request):
+    """
+    POST: /api/items/{item_id}/icon/chapters/batch
+    Batch saves multiple chapter icons to the item-level cache.
+    Payload: {"tracks": {"1": "<b64>", "2": "<b64>", ...}}
+    """
+    require_pin(request)
+    br: Bridge = request.app[BRIDGE]
+    item_id = request.match_info["item_id"]
+    body = await request.json()
+    tracks_dict = body.get("tracks") or {}
+    if not tracks_dict:
+        raise web.HTTPBadRequest(text="tracks dictionary required")
+
+    import base64
+    updated = []
+    item_map = br.store.state.item_icons.setdefault(item_id, {})
+
+    for ch_str, b64_data in tracks_dict.items():
+        try:
+            n = int(ch_str)
+        except ValueError:
+            continue
+        raw_bytes = base64.b64decode(b64_data.split(",")[-1])
+        px = await icons.shrink_cover(raw_bytes)
+        if px:
+            p = br.item_icon_path(item_id, n)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(px)
+            icon_hash = hashlib.sha1(px).hexdigest()[:8]
+            item_map[str(n)] = icon_hash
+            updated.append(n)
+
+    br.store.save()
+
+    affected = [s for s in br.store.state.slots.values() if s.item_id == item_id]
+    if affected:
+        await br.apply_icon_style(affected)
+
+    return web.json_response({"ok": True, "item_id": item_id, "updated": updated})
+
+
 async def index(request):
     if not (STATIC / "index.html").exists():
         return web.Response(status=503, text="The phone page has not been built. In web/, run: npm ci && npm run build")
@@ -1592,6 +1736,8 @@ def make_app(br: Bridge) -> web.Application:
     r.add_get("/api/cards/{slot}/icon.png", api_card_icon_preview)
     r.add_get("/api/cards/{slot}/icon/chapters", api_card_chapter_icons)
     r.add_route("*", "/api/cards/{slot}/icon/chapters/{item}/{n}", api_card_chapter_icon)
+    r.add_route("*", "/api/items/{item_id}/icon/chapters/{n}", api_item_chapter_icon)
+    r.add_post("/api/items/{item_id}/icon/chapters/batch", api_item_chapter_icons_batch)
     r.add_post("/api/icons", api_icon_defaults)
     r.add_post("/api/cards/{slot}/icon/ai", api_card_ai_pictures)
     r.add_post("/api/ai/claude", api_ai_claude)
