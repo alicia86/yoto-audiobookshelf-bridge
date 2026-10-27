@@ -1736,8 +1736,9 @@ def make_app(br: Bridge) -> web.Application:
     r.add_get("/api/cards/{slot}/icon.png", api_card_icon_preview)
     r.add_get("/api/cards/{slot}/icon/chapters", api_card_chapter_icons)
     r.add_route("*", "/api/cards/{slot}/icon/chapters/{item}/{n}", api_card_chapter_icon)
-    r.add_route("*", "/api/items/{item_id}/icon/chapters/{n}", api_item_chapter_icon)
     r.add_post("/api/items/{item_id}/icon/chapters/batch", api_item_chapter_icons_batch)
+    r.add_route("*", "/api/items/{item_id}/icon/chapters/{n}", api_item_chapter_icon)
+
     r.add_post("/api/icons", api_icon_defaults)
     r.add_post("/api/cards/{slot}/icon/ai", api_card_ai_pictures)
     r.add_post("/api/ai/claude", api_ai_claude)
