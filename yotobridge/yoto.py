@@ -197,6 +197,31 @@ class YotoAPI:
                 log.warning("Yoto card detail query failed for %s: %s", card_id, e)
                 return {}
 
+    async def update_playlist(self, card_id: str, title: str | None = None, chapters: list[dict] | None = None, cover_url: str | None = None) -> dict:
+        """Updates an existing MYO playlist on Yoto Cloud (titles, chapters/tracks, display icons)."""
+        card = await self.card_detail(card_id)
+        if not card:
+            raise RuntimeError(f"Card {card_id} not found in Yoto Cloud")
+
+        body: dict = {
+            "cardId": card_id,
+            "title": title or card.get("title", ""),
+            "content": card.get("content", {})
+        }
+        if "metadata" in card:
+            body["metadata"] = card["metadata"]
+        else:
+            body["metadata"] = {}
+
+        if cover_url:
+            body["metadata"]["cover"] = {"imageL": cover_url}
+
+        if chapters is not None:
+            body["content"]["chapters"] = chapters
+
+        res = await self._req("POST", "/content", json=body)
+        return res.get("card", res)
+
     async def device_status(self, device_id: str) -> dict:
         """Device status and configuration from Yoto API."""
         try:

@@ -1401,6 +1401,37 @@ async def api_yoto_card_detail(request):
     return web.json_response(card)
 
 
+async def api_yoto_update_card(request):
+    require_pin(request)
+    br: Bridge = request.app[BRIDGE]
+    cid = request.match_info["card_id"]
+    body = await request.json()
+    title = body.get("title")
+    chapters = body.get("chapters")
+    cover_url = body.get("cover_url")
+    updated = await br.yoto.update_playlist(cid, title=title, chapters=chapters, cover_url=cover_url)
+    return web.json_response({"ok": True, "card": updated})
+
+
+async def api_yoto_upload_icon(request):
+    require_pin(request)
+    br: Bridge = request.app[BRIDGE]
+    if request.content_type.startswith("application/json"):
+        body = await request.json()
+        import base64
+        b64 = body.get("image_b64") or body.get("png_b64")
+        filename = body.get("filename", "icon.png")
+        if not b64:
+            raise web.HTTPBadRequest(text="image_b64 required")
+        png_bytes = base64.b64decode(b64.split(",")[-1])
+    else:
+        png_bytes = await request.read()
+        filename = "icon.png"
+
+    icon_ref = await br.yoto.upload_icon(png_bytes, filename)
+    return web.json_response({"ok": True, "icon_ref": icon_ref})
+
+
 async def api_device_volume(request):
     require_pin(request)
     br: Bridge = request.app[BRIDGE]
@@ -1519,6 +1550,8 @@ def make_app(br: Bridge) -> web.Application:
     r.add_get("/api/yoto/groups", api_yoto_groups)
     r.add_get("/api/yoto/library", api_yoto_library)
     r.add_get("/api/yoto/card/{card_id}", api_yoto_card_detail)
+    r.add_put("/api/yoto/card/{card_id}", api_yoto_update_card)
+    r.add_post("/api/yoto/icons/upload", api_yoto_upload_icon)
     r.add_post("/api/yoto/volume", api_device_volume)
     r.add_get("/api/book/{item}", api_book)
     r.add_get("/api/libraries", api_libraries)
