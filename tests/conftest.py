@@ -304,6 +304,15 @@ class FakeYotoAPI:
         a.router.add_get("/content/mine", mine)
         a.router.add_get("/content/{cid}", one)
         a.router.add_post("/media/coverImage/user/me/upload", cover)
+
+        async def groups(r):
+            return web.json_response([{"id": "grp1", "title": "Bedtime Stories", "cardIds": ["existing1"]}])
+
+        async def family_lib(r):
+            return web.json_response({"cards": [{"cardId": "retail1", "title": "BrainBots", "shareType": "yoto"}]})
+
+        a.router.add_get("/card/family/library/groups", groups)
+        a.router.add_get("/card/family/library", family_lib)
         return a
 
 
@@ -328,6 +337,9 @@ class FakeControl:
 
     async def stop(self, d):
         self.commands.append(("stop", d))
+
+    async def set_volume(self, d, vol):
+        self.commands.append(("volume", d, vol))
 
 
 @pytest_asyncio.fixture

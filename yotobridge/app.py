@@ -1378,6 +1378,41 @@ async def api_yoto_playlists(request):
                               if not c.get("deleted")])
 
 
+async def api_yoto_groups(request):
+    br: Bridge = request.app[BRIDGE]
+    groups = await br.yoto.groups()
+    return web.json_response(groups)
+
+
+async def api_yoto_library(request):
+    br: Bridge = request.app[BRIDGE]
+    cards = await br.yoto.family_library()
+    return web.json_response(cards)
+
+
+async def api_yoto_card_detail(request):
+    br: Bridge = request.app[BRIDGE]
+    cid = request.match_info["card_id"]
+    card = await br.yoto.card_detail(cid)
+    if not card:
+        raise web.HTTPNotFound()
+    return web.json_response(card)
+
+
+async def api_device_volume(request):
+    require_pin(request)
+    br: Bridge = request.app[BRIDGE]
+    body = await request.json()
+    device_id = body.get("device_id")
+    volume = body.get("volume")
+    if not device_id or volume is None:
+        raise web.HTTPBadRequest(text="device_id and volume required")
+    if br.control and br.control.connected:
+        await br.control.set_volume(device_id, int(volume))
+        return web.json_response({"ok": True, "device_id": device_id, "volume": int(volume)})
+    return web.json_response({"ok": False, "error": "Control connection not connected"}, status=503)
+
+
 async def index(request):
     if not (STATIC / "index.html").exists():
         return web.Response(status=503, text="The phone page has not been built. In web/, run: npm ci && npm run build")
@@ -1420,6 +1455,10 @@ def make_app(br: Bridge) -> web.Application:
     r.add_post("/api/yoto/login", api_yoto_login)
     r.add_post("/api/yoto/finish", api_yoto_finish)
     r.add_get("/api/yoto/playlists", api_yoto_playlists)
+    r.add_get("/api/yoto/groups", api_yoto_groups)
+    r.add_get("/api/yoto/library", api_yoto_library)
+    r.add_get("/api/yoto/card/{card_id}", api_yoto_card_detail)
+    r.add_post("/api/yoto/volume", api_device_volume)
     r.add_get("/api/book/{item}", api_book)
     r.add_get("/api/libraries", api_libraries)
     r.add_get("/api/books", api_books)

@@ -161,8 +161,49 @@ class YotoAPI:
     async def my_playlists(self) -> list[dict]:
         return (await self._req("GET", "/content/mine")).get("cards", [])
 
+    async def groups(self) -> list[dict]:
+        """User-defined card groups / collections in the Yoto family library."""
+        try:
+            r = await self._req("GET", "/card/family/library/groups")
+            if isinstance(r, list):
+                return r
+            return r.get("groups", r.get("items", []))
+        except Exception as e:
+            log.warning("Yoto groups query failed: %s", e)
+            return []
+
+    async def family_library(self) -> list[dict]:
+        """Complete Yoto family library cards (physical retail cards + MYO cards)."""
+        try:
+            r = await self._req("GET", "/card/family/library")
+            if isinstance(r, list):
+                return r
+            return r.get("cards", r.get("items", []))
+        except Exception as e:
+            log.warning("Yoto family library query failed: %s", e)
+            return []
+
     async def playlist(self, card_id: str) -> dict:
         return (await self._req("GET", f"/content/{card_id}")).get("card", {})
+
+    async def card_detail(self, card_id: str) -> dict:
+        """Card detail and metadata for any card in the family library."""
+        try:
+            return (await self._req("GET", f"/content/{card_id}")).get("card", {})
+        except Exception:
+            try:
+                return (await self._req("GET", f"/card/{card_id}")).get("card", {})
+            except Exception as e:
+                log.warning("Yoto card detail query failed for %s: %s", card_id, e)
+                return {}
+
+    async def device_status(self, device_id: str) -> dict:
+        """Device status and configuration from Yoto API."""
+        try:
+            return await self._req("GET", f"/device-v2/devices/{device_id}")
+        except Exception as e:
+            log.warning("Yoto device status query failed for %s: %s", device_id, e)
+            return {}
 
     async def upload_cover(self, image: bytes, content_type: str = "image/jpeg") -> str | None:
         try:
@@ -400,3 +441,8 @@ class YotoControl:
 
     async def stop(self, device_id: str):
         await self.client.card_stop(device_id)
+
+    async def set_volume(self, device_id: str, volume: int):
+        """Sets the player volume level (0-100)."""
+        vol = max(0, min(100, int(volume)))
+        await self.client._publish(f"device/{device_id}/command/volume", json.dumps({"volume": vol}))

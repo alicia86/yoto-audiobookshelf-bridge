@@ -2176,3 +2176,35 @@ async def test_two_copies_at_once_when_offline_parallel_allows(env):
     gate.set()
     assert (await _wait_offline(client, a.slot))["status"] == "ready"
     assert (await _wait_offline(client, b.slot))["status"] == "ready"
+
+
+async def test_yoto_groups_library_and_volume_endpoints(env):
+    """Verifies that the new /api/yoto/groups, /api/yoto/library, and /api/yoto/volume endpoints work."""
+    br, client, _ = await env.make()
+
+    # 1. Groups endpoint
+    res_groups = await client.get("/api/yoto/groups")
+    assert res_groups.status == 200
+    groups_data = await res_groups.json()
+    assert isinstance(groups_data, list)
+    assert len(groups_data) == 1
+    assert groups_data[0]["title"] == "Bedtime Stories"
+    assert "existing1" in groups_data[0]["cardIds"]
+
+    # 2. Family Library endpoint
+    res_lib = await client.get("/api/yoto/library")
+    assert res_lib.status == 200
+    lib_data = await res_lib.json()
+    assert isinstance(lib_data, list)
+    assert len(lib_data) == 1
+    assert lib_data[0]["cardId"] == "retail1"
+    assert lib_data[0]["title"] == "BrainBots"
+
+    # 3. Volume control endpoint
+    res_vol = await client.post("/api/yoto/volume", json={"device_id": "dev-mini", "volume": 35})
+    assert res_vol.status == 200
+    vol_data = await res_vol.json()
+    assert vol_data.get("ok") is True
+    assert vol_data.get("volume") == 35
+    assert ("volume", "dev-mini", 35) in br.control.commands
+
