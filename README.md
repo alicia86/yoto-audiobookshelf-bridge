@@ -42,7 +42,15 @@ Progress is written through real ABS playback sessions (`/api/items/{id}/play`, 
 You need: an always-on machine with Docker (the ABS host, or any home server), an ABS API key or user API token, and a Yoto developer client id.
 
 1. **ABS key.** Use a key belonging to the user whose progress the Yoto should share: the account logged in on the phone you want to hand off with. On ABS 2.26 or newer, an admin creates one on the **API Keys** tab of Settings → Users (a tab on that page, not inside a user). On older ABS, open that user under Settings → Users and copy its **API Token**; it works the same way, but newer ABS treats these tokens as legacy, so switch to an API key after upgrading. Paste it straight into the config file; it is effectively that user's password. (For a child's own ABS user, or one per player, see [below](#a-childs-own-abs-user-and-one-per-child).)
-2. **Yoto client id.** Sign in at [dashboard.yoto.dev](https://dashboard.yoto.dev) with the Yoto account your players are on, create an app as a **Public Client** with the scopes `user:content:manage`, `family:devices:view`, `family:devices:control`, `offline_access` and (for chapter icons on offline copies) `user:icons:manage`, and copy the client id (there is no secret). Under **Allowed Callback URLs** add `<public_url>/s/yoto-callback`, for example `https://yoto.example.com/s/yoto-callback` (see [Choosing `public_url`](#choosing-public_url)). The bridge signs in with the browser login (authorization code + PKCE); Yoto refuses the older device-code login for new apps.
+2. **Yoto client id.** Sign in at [dashboard.yoto.dev](https://dashboard.yoto.dev) with the Yoto account your players are on, create an app as a **Public Client** with the scopes:
+   - `user:content:manage`
+   - `family:devices:view`
+   - `family:devices:control`
+   - `family:library:view` (for browsing family library cards and groups)
+   - `family:library:manage` (for organizing and updating cards in family groups)
+   - `user:icons:manage` (for chapter and track display icon uploads)
+   - `offline_access`
+   Copy the client id (there is no secret). Under **Allowed Callback URLs** add `<public_url>/s/yoto-callback`, for example `https://yoto.example.com/s/yoto-callback` (see [Choosing `public_url`](#choosing-public_url)). The bridge signs in with the browser login (authorization code + PKCE); Yoto refuses the older device-code login for new apps.
 3. **Config.** Copy this repo to the Docker host (without `.git`; `git archive HEAD | ssh <user>@<host> 'mkdir -p <dir> && tar -xf - -C <dir>'` works and never touches `data/`), then on the host:
    ```sh
    mkdir data && cp config.example.yaml data/config.yaml
@@ -234,27 +242,62 @@ Progress is saved to the ABS user whose key the bridge uses. If a child listens 
 
   "Make offline" copies from the position of the card's assigned player, or the default user.
 
-### How long a card takes to start
+### Security & External API Authentication
 
-Between a tap and sound, three things happen: the Yoto looks the card up in Yoto's cloud and asks for the audio (through your proxy or tunnel, if you use one); the bridge opens an ABS session and starts sending audio; the player fills its buffer and starts playing. Only the middle part is the bridge's.
+The bridge includes dual-layer security tailored for both local web users and external automation clients (such as Home Assistant or the ESP32 broker):
 
-To make it short, the bridge keeps the first 30 seconds of every card (`warm_start_seconds`), from where ABS has the book, already encoded. A tap then gets audio at once, and the player's buffer fills at network speed while ffmpeg starts on the rest. The bridge re-checks ABS positions every 5 minutes (`warm_refresh_seconds`) and after every listening session; if the phone has moved the book since, the tap starts normally from the new position.
+- **Arr-Style API Key (`api_key`)**:
+  Protects all `/api/*` management endpoints against unauthorized external requests.
+  - Set `api_key: "your-32-char-hex-key"` in `config.yaml` or pass via environment variable `API_KEY` / `BRIDGE_API_KEY`.
+  - External callers can authenticate using either:
+    - HTTP Header: `X-Api-Key: <key>` or `Authorization: Bearer <key>`
+    - Query Parameter (GET requests): `?apikey=<key>`
+  - The built-in phone web UI (`web/`) running on the same origin/host is seamlessly permitted, leaving card configuration actions guarded by `ui_pin` if enabled.
+  - `/api/status` is public for status checks and service discovery.
+  - An API key can be dynamically regenerated via `POST /api/security/regenerate-key` (which saves the new key to `config.yaml`).
 
-The log shows where a slow start spends its time. Note the time you put the card in, then read:
+- **Phone Web UI PIN (`ui_pin`)**:
+  Protects sensitive card-changing actions directly on the phone web interface (e.g. changing which book a card plays, creating cards, making offline copies). When set, the web UI prompts once for the PIN and remembers it locally.
 
-- `GET <card> from …`: the player asked for the audio. Time before this is the Yoto and Yoto's cloud (and any proxy or tunnel).
-- `<book>: first audio sent 0.12s after the request (warm start)`: the bridge's share.
-- `<book> playing on <player>, 2.3s after the player asked for the audio`: the rest is the player buffering.
+### Extended Yoto Management Endpoints
+
+The bridge exposes management endpoints used by external brokers and dashboards:
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/status` | `GET` | Bridge health, active devices, now playing, and login state (public) |
+| `/api/yoto/library` | `GET` | User and family library playlists and cards (requires `family:library:view`) |
+| `/api/yoto/groups` | `GET` | Family card groups and collection tags |
+| `/api/yoto/card/{card_id}` | `GET` | Detailed card metadata, tracks, and display icons |
+| `/api/yoto/card/{card_id}` | `PUT` | Update MYO playlist track content and chapter structure |
+| `/api/yoto/icons/upload` | `POST` | Upload custom 16x16 PNG pixel display icons directly to Yoto's CDN |
+| `/api/yoto/volume` | `POST` | Adjust player volume directly (`{"device_id": "...", "volume": 12}`) |
+| `/api/security/regenerate-key` | `POST` | Regenerate the bridge API key and persist to config |
 
 
 
 ### Alerts when something breaks
 
-A broken Yoto login or an unreachable `public_url` otherwise shows up as "the card doesn't play" at bedtime. The bridge can push a notification through [ntfy](https://ntfy.sh) (free, no account):
+A broken Yoto login or an unreachable `public_url` otherwise shows up as "the card doesn't play" at bedtime. The bridge can push notifications through **Discord** webhooks and/or [ntfy](https://ntfy.sh):
 
-1. Install the ntfy app on your phone and subscribe to a topic with a long random name, e.g. `yoto-bridge-7f3k9q2m`. Anyone who knows the name can read it, so don't use a guessable one. (Your own ntfy server works too; put an access token in `ntfy_token`.)
-2. In `data/config.yaml`: `ntfy_url: https://ntfy.sh/yoto-bridge-7f3k9q2m`, then restart the bridge.
-3. Send a test: `curl -X POST http://<bridge-host>:8090/api/alerts/test` (add `-H "X-Pin: <pin>"` if you set `ui_pin`).
+- **Discord webhook**:
+  1. In Discord: Server Settings → Integrations → Webhooks → New Webhook, and copy the Webhook URL.
+  2. In `data/config.yaml`:
+     ```yaml
+     discord_webhook_url: https://discord.com/api/webhooks/<id>/<token>
+     discord_username: Yoto Bridge
+     # discord_avatar_url: ""
+     ```
+  3. Messages older than 48 hours are automatically pruned from the Discord channel to prevent notification clutter.
+- **ntfy**:
+  1. Install the ntfy app on your phone and subscribe to a topic with a long random name, e.g. `yoto-bridge-7f3k9q2m`. Anyone who knows the name can read it, so don't use a guessable one. (Your own ntfy server works too; put an access token in `ntfy_token`.)
+  2. In `data/config.yaml`: `ntfy_url: https://ntfy.sh/yoto-bridge-7f3k9q2m`, then restart the bridge.
+
+3. **Send a test notification**:
+   ```sh
+   curl -X POST http://<bridge-host>:8090/api/alerts/test -H "X-Api-Key: <api_key>"
+   ```
+   (Or with `-H "X-Pin: <pin>"` if `ui_pin` is set, or unauthenticated from the local phone web UI).
 
 Every 5 minutes (`alert_check_minutes`) the bridge checks that ABS answers and accepts its key, that the Yoto login still works, that the player connection (MQTT) is up, and that `public_url` reaches this bridge from outside (it fetches `<public_url>/s/health`). A problem is sent after two failed checks in a row (`alert_after_failures`), so an ABS restart doesn't wake you, and once more when it is fixed. A card that cannot play is sent at once. Current problems also show as a banner on the phone page. If your network can't reach its own public address from inside (some routers can't), set `alert_check_public: false`.
 
@@ -293,7 +336,7 @@ Things only a real player can answer that have not been confirmed yet. Each maps
 - **Yoto cloud is in the loop** for card lookup and MQTT. If Yoto's service is down, cards do not start, even though the audio comes from your server.
 - **Per-player ABS users** rely on the player's MQTT event naming the card (which it does), unless the phone page started it or `ip:` is set. If that event arrives late, the card starts as the default user and restarts on the right one. With one ABS user for all players this does not matter.
 - **One player per card at a time.** Two players playing the same card simultaneously share one session.
-- **Security:** the stream URLs have no login (the Yoto cannot send credentials) but use unguessable 12-character slots. If you publish the bridge, publish only `/s/`, never the whole bridge: the phone page and `/api/` can change cards and browse the library. The phone page can be PIN-protected for card changes with `ui_pin`. Do not port-forward the bridge.
+- **Security:** the stream URLs have no login (the Yoto cannot send credentials) but use unguessable 12-character slots. If you publish the bridge, publish only `/s/`, never the whole bridge. All management endpoints under `/api/*` are protected by an Arr-style `api_key` (`X-Api-Key` or Bearer token) for external consumers and brokers, while the same-origin phone web interface is protected by `ui_pin` for card and playback changes. Do not expose unauthenticated management ports to the public internet.
 - **Transcoding:** every stream is re-encoded to 64 kbps mono MP3 with ffmpeg. Measured on a desktop CPU: 10 minutes of AAC took 4 s of CPU, i.e. under 1 % of one core per playing Yoto; a low-power server CPU will be a few times that.
 
 ## Development
