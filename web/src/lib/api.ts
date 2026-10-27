@@ -34,11 +34,15 @@ export async function api<T = unknown>(path: string, opts: { method?: string; bo
     body: raw ? (opts.body as Blob) : opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
   })
   if (r.status === 401) {
-    const p = await askPin()
-    if (p) {
-      setPin(p)
-      return api<T>(path, opts)
+    const text = await r.text()
+    if (text.includes("PIN required") || text.includes("pin")) {
+      const p = await askPin()
+      if (p) {
+        setPin(p)
+        return api<T>(path, opts)
+      }
     }
+    throw new Error(text || "Unauthorized")
   }
   const text = await r.text()
   let data: unknown

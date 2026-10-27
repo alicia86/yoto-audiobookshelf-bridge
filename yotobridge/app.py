@@ -1479,7 +1479,23 @@ async def api_auth(request, handler):
     if path.startswith("/s/") or path == CALLBACK_PATH or path == "/" or path.startswith("/static/"):
         return await handler(request)
 
-    # 2. Check if API key is enforced
+    # 2. Exempt public status endpoint (needed by web UI to discover pin_required and login state)
+    if path == "/api/status":
+        return await handler(request)
+
+    # 3. Exempt same-origin requests originating from the built-in web frontend
+    # (The web UI is protected by ui_pin; api_key protects external API/broker integrations)
+    sec_fetch_site = request.headers.get("Sec-Fetch-Site", "")
+    if sec_fetch_site in ("same-origin", "same-site"):
+        return await handler(request)
+
+    host = request.headers.get("Host", "")
+    origin = request.headers.get("Origin", "")
+    referer = request.headers.get("Referer", "")
+    if host and ((origin and host in origin) or (referer and host in referer)):
+        return await handler(request)
+
+    # 4. Check if API key is enforced
     br: Bridge = request.app.get(BRIDGE)
     if not br or not br.cfg.api_key:
         return await handler(request)
