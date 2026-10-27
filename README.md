@@ -52,6 +52,7 @@ You need: an always-on machine with Docker (the ABS host, or any home server), a
    - `offline_access`
 
    Copy the client id (there is no secret). 
+   
    Under **Allowed Callback URLs** add `<public_url>/s/yoto-callback`, for example `https://yoto.example.com/s/yoto-callback` or `http://127.0.0.1:8090/callback` (see [Choosing `public_url`](#choosing-public_url)). The bridge signs in with the browser login (authorization code + PKCE); Yoto refuses the older device-code login for new apps.
 3. **Config.** Copy this repo to the Docker host (without `.git`; `git archive HEAD | ssh <user>@<host> 'mkdir -p <dir> && tar -xf - -C <dir>'` works and never touches `data/`), then on the host:
    ```sh
