@@ -21,7 +21,7 @@ import aiohttp
 
 log = logging.getLogger(__name__)
 # user:icons:manage: chapter icons on offline copies. The Yoto app must have it ticked (dashboard.yoto.dev).
-SCOPES = "offline_access user:content:manage user:icons:manage family:devices:view family:devices:control"
+SCOPES = "offline_access user:content:manage user:icons:manage family:devices:view family:devices:control family:library:view family:library:manage"
 
 
 class YotoNotLoggedIn(Exception):
