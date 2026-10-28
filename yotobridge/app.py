@@ -735,13 +735,53 @@ async def api_status(request):
         ev = br.pm.devices.get(did, {})
         pb = next((p for p in br.pm.by_slot.values() if p.device_id == did), None)
         book, at = br.pm.book_position(pb) if pb else (None, None)
+        now_playing = book.title if pb else None
+        item_id = book.item_id if pb else None
+        position = round(at) if pb and at is not None else None
+        duration = round(book.duration) if pb and getattr(book, "duration", None) else None
+        playing_speed = pb.speed if pb else None
+
+        # If there is no active HTTP streaming session in pb (e.g. offline copy playback or stream session closed),
+        # inspect the latest MQTT event for an active card and resolve from known slot or offline metadata.
+        if not now_playing:
+            card_id = ev.get("cardId")
+            slot = br.store.by_yoto_card(card_id) if card_id and card_id not in ("none", "") else None
+            # If cardId isn't on the event or doesn't match a slot, check if this device has a remote slot with active playback
+            if not slot and ev.get("playbackStatus") in ("playing", "paused"):
+                slot = br.store.remote_for(did)
+            if slot:
+                item_id = slot.item_id or None
+                off = slot.offline or {}
+                # Calculate position and duration
+                if off and off.get("tracks"):
+                    key = ev.get("chapterKey") or ev.get("trackKey")
+                    seg = next((t for t in off.get("tracks") or [] if t.get("key") == key), None)
+                    if not seg:
+                        seg = off["tracks"][0]
+                    speed = float(off.get("speed") or 1.0)
+                    now_playing = seg.get("book") or slot.title or slot.yoto_title
+                    item_id = seg.get("item_id") or slot.item_id
+                    duration = round(seg.get("book_duration") or off.get("duration") or 0) or None
+                    if ev.get("position") is not None:
+                        pos_in_seg = float(ev["position"]) * speed
+                        position = round(seg.get("start", 0) + min(pos_in_seg, seg.get("end", seg.get("start", 0)) - seg.get("start", 0)))
+                    elif off.get("last_pos") is not None:
+                        position = round(off["last_pos"])
+                else:
+                    now_playing = slot.title or slot.yoto_title or slot.series_name
+                    # Try to get position from MQTT event
+                    if ev.get("position") is not None:
+                        position = round(float(ev["position"]))
+                if not playing_speed and slot.speed:
+                    playing_speed = slot.speed
+
         devices.append({"id": did, "name": br.device_name(did), "online": d.get("online"),
                         "status": ev.get("playbackStatus"),
-                        "now_playing": book.title if pb else None, "item_id": book.item_id if pb else None,
-                        "position": round(at) if pb else None,
-                        "duration": round(book.duration) if pb else None,
+                        "now_playing": now_playing, "item_id": item_id,
+                        "position": position,
+                        "duration": duration,
                         "speed": float(br.store.state.speeds.get(did, 1.0)),
-                        "playing_speed": pb.speed if pb else None})
+                        "playing_speed": playing_speed})
     return web.json_response({
         "yoto_logged_in": br.auth.logged_in, "yoto_client_id_set": bool(br.cfg.yoto_client_id),
         "login_pending": br.auth.pending if br.auth.pending and br.auth.pending["expires_at"] > time.time() else None, "mqtt": br.control.connected, "devices": devices,
