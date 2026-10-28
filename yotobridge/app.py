@@ -914,12 +914,31 @@ async def api_books(request):
 
 async def api_continue(request):
     br: Bridge = request.app[BRIDGE]
-    items = await br.abs.items_in_progress()
-    out = []
-    for i in items[:12]:
-        prog = await br.abs.progress(i["id"])
-        if prog and not prog.get("isFinished"):
-            out.append(_book(i, prog))
+    # Gather distinct ABS API keys: master key + any player-specific keys
+    keys = [br.cfg.abs_api_key]
+    for dev in br.cfg.devices.values():
+        if dev.abs_api_key and dev.abs_api_key not in keys:
+            keys.append(dev.abs_api_key)
+
+    seen: dict[str, tuple[dict, dict, int | float]] = {}  # item_id -> (item_data, progress_data, last_update)
+    for k in keys:
+        try:
+            items = await br.abs.items_in_progress(k)
+        except ABSError:
+            continue
+        for i in items:
+            iid = i["id"]
+            last_update = i.get("progressLastUpdate") or 0
+            if iid in seen and seen[iid][2] >= last_update:
+                continue
+            prog = await br.abs.progress(iid, k)
+            if prog and not prog.get("isFinished"):
+                prog_update = prog.get("lastUpdate") or last_update
+                seen[iid] = (i, prog, prog_update)
+
+    # Sort all in-progress books by most recently listened to
+    sorted_items = sorted(seen.values(), key=lambda x: x[2], reverse=True)
+    out = [_book(i, p) for i, p, _ in sorted_items[:18]]
     return web.json_response(out)
 
 
