@@ -15,9 +15,9 @@ Use this document to track hands-on verification, recording status (`[ ]` Pendin
 ### 1.1 Web UI "🔔 Test Discord" Button
 - **Action:** Open Bridge web interface (`http://192.168.1.11:8090` or `https://yoto.ohiodeans.us`), go to **Cards** tab, scroll to bottom **Alert Notifications** section, and click **🔔 Test Discord**.
 - **Expected Result:** Toast appears indicating test alert was sent; an informational embed (`🔵 Yoto Bridge Alert: System Test`) arrives in the configured Discord alerts channel with timestamp and footer.
-- **Status:** [ ]
+- **Status:** [ PASS ]
 > **Comments / Notes:**  
-> 
+> Tested and working as expected:
 
 ---
 
@@ -35,18 +35,18 @@ Use this document to track hands-on verification, recording status (`[ ]` Pendin
 ### 2.1 Authenticated Bridge Connection Probe (Valid Key)
 - **Action:** In Broker Admin Dashboard (`http://127.0.0.1:5055/admin`), go to **Settings** → **API Credentials**. Ensure Bridge URL is set and Master API Key matches `config.yaml` (`8e57054ac7c53115821110fe4f145488`). Click **Test Connection**.
 - **Expected Result:** Success banner: `Bridge Connected (XXms)! Status: Logged in, X active players detected • API Key Verified.`
-- **Status:** [ ]
+- **Status:** [ PASS ]
 > **Comments / Notes:**  
-> 
+> Tested with and without bridge API key. 
 
 ---
 
 ### 2.2 Rejection of Missing or Invalid API Key
 - **Action:** Modify or clear the Master API Key in the Broker Settings form and click **Test Connection**.
 - **Expected Result:** Connection test fails with HTTP 401: `Bridge requires authentication, but no Master API Key is configured in the Broker` or `Bridge rejected the provided Master API Key`.
-- **Status:** [ ]
+- **Status:** [ BLOCKED ]
 > **Comments / Notes:**  
-> 
+> unable to clear the Broker Master API Key. There is currently nothing to test that is using the Master API key, so this test is currently blocked. This test should be revisited once the Master API key is being used for testing.
 
 ---
 
@@ -55,9 +55,9 @@ Use this document to track hands-on verification, recording status (`[ ]` Pendin
 ### 3.1 Bridge UI Inspection of Curated Book (Boxcar Children Vol 4)
 - **Action:** In Bridge web UI, locate the card playing *The Boxcar Children Volume 4* (`68b4d0eb-1c0d-42fe-84f8-a546c9c223a7`) or inspect its chapter icon list.
 - **Expected Result:** The 39 custom icons previously curated in the Broker display in the chapter list without requiring per-slot customization.
-- **Status:** [ ]
+- **Status:** [ PASS ]
 > **Comments / Notes:**  
-> 
+> The icons appeared when viewing the "Pictures by Chapter" but have not yet sent it to the Yoto for testing of the display. Currently unclear what Pixel Icon setting should be used when using the custom icons.
 
 ---
 

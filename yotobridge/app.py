@@ -90,12 +90,15 @@ class Bridge:
 
     def icon_style(self, slot) -> str:
         """The card's own icon style, else the default. A card set to its own picture without one
-        uploaded uses the default."""
+        uploaded uses the default. If custom icons exist for the book, custom style is used."""
         own = slot.icon_style if slot and slot.kind == "card" else ""
         if own == "custom":
-            if slot.icon_custom or slot.icon_chapters:
+            if slot.icon_custom or slot.icon_chapters or (slot.item_id and slot.item_id in self.store.state.item_icons):
                 return own
             own = ""
+        # If item-level custom chapter icons exist for this book and no explicit style override, treat as custom
+        if not own and slot and slot.item_id and self.store.state.item_icons.get(slot.item_id):
+            return "custom"
         style = own or self.store.state.icon_style
         return style if style in icons.STYLES and style != "custom" else icons.DEFAULT_STYLE
 
@@ -105,10 +108,14 @@ class Bridge:
         style = self.icon_style(slot)
         if style == icons.DEFAULT_STYLE:
             return ""
+        item_hash = ""
+        if slot and slot.item_id and slot.item_id in self.store.state.item_icons:
+            item_hash = str(sorted(self.store.state.item_icons[slot.item_id].items()))
         extra = (str(self.store.state.icon_allow_all) if style == "theme"
-                 else f"{slot.icon_custom}|{sorted(slot.icon_chapters.items())}|{self.fallback_style()}"
+                 else f"{slot.icon_custom}|{sorted(slot.icon_chapters.items())}|{item_hash}|{self.fallback_style()}"
                  if style == "custom" else "")
         return hashlib.sha1(f"{style}|{extra}".encode()).hexdigest()[:8]
+
 
     def _icon_base(self, slot) -> str | None:
         if not self.cfg.chapter_icons or self.icon_style(slot) == "none":
@@ -285,15 +292,20 @@ class Bridge:
     async def icon_png(self, slot, item_id: str, pos: float | None, style: str | None = None) -> bytes:
         """The icon of the chapter at pos (None: no chapter number) in the card's style."""
         style = style or self.icon_style(slot)
-        if style == "custom":
+        # 1. Always check if a custom chapter picture or item-level curated icon exists
+        if style != "none":
             number = icons.chapter_number(await self.chapters(item_id), pos) if pos is not None else None
-            pic = self.custom_picture(slot, item_id, number) if slot else None
-            try:
-                if pic:
+            pic = self.custom_picture(slot, item_id, number)
+            if pic:
+                try:
                     return icons.png(pic[1].read_bytes())
-            except OSError:
-                pass
+                except OSError:
+                    pass
+
+        # 2. If style was 'custom' but no custom picture existed, fall back to default style
+        if style == "custom":
             style = self.fallback_style()
+
         if style == "theme":
             ic = await self.theme_icon(slot, item_id, pos)
             raw = await self.icon_library.png(ic) if ic else None
@@ -301,6 +313,7 @@ class Bridge:
             if px:
                 return icons.png(px)
             style = icons.DEFAULT_STYLE          # no matching icon (e.g. "Chapter 7"): cover and number
+
         chapters = await self.chapters(item_id)
         number = icons.chapter_number(chapters, pos) if pos is not None else None
         fraction = None
