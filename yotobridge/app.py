@@ -675,6 +675,10 @@ async def _respond(request, br: Bridge, slot, opener, head_length) -> web.Stream
         pb, start_sec = await opener(start_byte)
     except ABSError as e:
         log.error("ABS refused playback: %s", e)
+        device = slot.device_id or br.pm._device_from_events(slot.yoto_card_id)
+        if device and br.control and br.control.connected and e.status in (401, 403):
+            # Tell the player to stop so it does not loop indefinitely retrying a forbidden stream
+            br.pm._bg(br.control.stop(device))
         br.alerts.play_failed(slot.series_name or slot.title or slot.yoto_title or slot.slot, f"Audiobookshelf refused it: {e}")
         raise web.HTTPBadGateway(text=str(e))
     except Exception as e:
@@ -937,6 +941,19 @@ async def api_play(request):
     if not br.control.connected:
         raise web.HTTPServiceUnavailable(text="Not connected to Yoto (MQTT). Connect Yoto first.")
     slot = await br.ensure_remote_slot(device_id, br.device_name(device_id))
+    # Check that this player's ABS user account has access to this book
+    player_key = br.cfg.abs_key_for(device_id)
+    try:
+        if player_key and player_key != br.cfg.abs_api_key:
+            await br.abs.item(item_id, key=player_key)
+    except ABSError as e:
+        dev_name = br.device_name(device_id)
+        if e.status in (401, 403):
+            raise web.HTTPForbidden(
+                text=f"{dev_name}'s Audiobookshelf account does not have access/permission to play this book (ABS {e.status})."
+            )
+        raise web.HTTPBadGateway(text=f"Audiobookshelf returned an error for {dev_name}: {e}")
+
     # Stop whatever this player is streaming from the bridge, so its position is saved first.
     for pb in list(br.pm.by_slot.values()):
         if pb.device_id == device_id:
@@ -948,11 +965,11 @@ async def api_play(request):
         await br.save_playlist(slot, cover=False)    # the remote playlist's tracks follow the book's chapters
     seconds_in = None
     if br.cfg.resume_mode == "seconds_in":
-        prog = await br.abs.progress(item_id, br.cfg.abs_key_for(device_id)) or {}
+        prog = await br.abs.progress(item_id, player_key) or {}
         seconds_in = max(0, int(prog.get("currentTime") or 0) - br.cfg.rewind_seconds)
     track = 1
     if br.chapter_mode(slot):
-        prog = await br.abs.progress(item_id, br.cfg.abs_key_for(device_id)) or {}
+        prog = await br.abs.progress(item_id, player_key) or {}
         duration, _ = await br.book_info(item_id)
         at = br.pm._resume_point(float(prog.get("currentTime") or 0), duration)
         track = chapter_tracks.track_for(slot, item_id, at) or 1

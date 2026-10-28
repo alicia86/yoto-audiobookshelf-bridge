@@ -8,5 +8,3 @@ yotobridge/static/
 
 # local Python environments (e.g. for tools/audio_chapters.py)
 .venv*/
-
-*_TEST_LOG.md
