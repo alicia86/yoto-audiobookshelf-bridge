@@ -948,7 +948,7 @@ async def api_play(request):
             await br.abs.item(item_id, key=player_key)
     except ABSError as e:
         dev_name = br.device_name(device_id)
-        if e.status in (401, 403):
+        if e.status in (401, 403, 404):
             raise web.HTTPForbidden(
                 text=f"{dev_name}'s Audiobookshelf account does not have access/permission to play this book (ABS {e.status})."
             )
