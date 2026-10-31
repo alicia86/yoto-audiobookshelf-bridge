@@ -992,13 +992,31 @@ async def api_cover(request):
 
 
 async def api_play(request):
-    """Play any ABS book on a player, no card needed: point that player's remote slot at the book
-    and tell the player (MQTT) to start its remote playlist. The stream starts at the ABS position."""
+    """Play any ABS book or native Yoto card on a player."""
     br: Bridge = request.app[BRIDGE]
     body = await request.json()
-    device_id, item_id = body["device_id"], body["item_id"]
+    device_id = body.get("device_id")
+    card_id = body.get("card_id")
+    item_id = body.get("item_id")
+    track = int(body.get("track") or body.get("chapter") or 1)
+
+    if not device_id:
+        raise web.HTTPBadRequest(text="device_id required")
+
     if not br.control.connected:
         raise web.HTTPServiceUnavailable(text="Not connected to Yoto (MQTT). Connect Yoto first.")
+
+    # 1. Native Yoto Card Playback (Retail cards or MYO cards)
+    if card_id and not item_id:
+        br.pm.expect(device_id, card_id)
+        await br.control.play(device_id, card_id, None, track=track)
+        log.info("Commanded Yoto %s to play card %s on track %d via MQTT", device_id, card_id, track)
+        return web.json_response({"ok": True, "type": "yoto", "card_id": card_id, "track": track, "device_id": device_id})
+
+    # 2. Audiobookshelf Book Playback
+    if not item_id:
+        raise web.HTTPBadRequest(text="Either card_id or item_id is required")
+
     slot = await br.ensure_remote_slot(device_id, br.device_name(device_id))
     # Check that this player's ABS user account has access to this book
     player_key = br.cfg.abs_key_for(device_id)
