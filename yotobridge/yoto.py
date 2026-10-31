@@ -441,7 +441,7 @@ class YotoControl:
                 ev = {"cardId": f.get("card_id"), "position": f.get("position"), "trackLength": f.get("track_length"),
                       "playbackStatus": getattr(f.get("playback_status"), "value", f.get("playback_status")),
                       "source": f.get("source"), "streaming": f.get("streaming"), "trackKey": f.get("track_key"),
-                      "chapterKey": f.get("chapter_key")}
+                      "chapterKey": f.get("chapter_key"), "chapterTitle": f.get("chapter_title"), "trackTitle": f.get("track_title")}
                 self.on_event(msg.player_id, {k: v for k, v in ev.items() if v is not None})
 
         await self.client.connect(None, device_ids, cb, token_getter=self.auth.access_token)

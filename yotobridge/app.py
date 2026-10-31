@@ -72,6 +72,7 @@ class Bridge:
         self._durations: dict[str, float] = {}
         self.seeking: set[str] = set()
         self.jumping: dict[str, tuple[int, float]] = {}   # slot -> (track the player was told to start, when)
+        self._yoto_card_cache: dict[str, dict] = {}
         self.icon_upload_error = ""
         self.last_error = ""
         self.transfer = None                # old MYO card -> ABS (transfer.py), set by make_app
@@ -741,14 +742,19 @@ async def api_status(request):
         duration = round(book.duration) if pb and getattr(book, "duration", None) else None
         playing_speed = pb.speed if pb else None
 
+        author = None
+        chapter_title = ev.get("chapterTitle") or ev.get("trackTitle") or None
+        cover_url = None
+
         # If there is no active HTTP streaming session in pb (e.g. offline copy playback or stream session closed),
-        # inspect the latest MQTT event for an active card and resolve from known slot or offline metadata.
+        # inspect the latest MQTT event for an active card and resolve from known slot, offline metadata, or Yoto cloud.
         if not now_playing:
             card_id = ev.get("cardId")
             slot = br.store.by_yoto_card(card_id) if card_id and card_id not in ("none", "") else None
-            # If cardId isn't on the event or doesn't match a slot, check if this device has a remote slot with active playback
-            if not slot and ev.get("playbackStatus") in ("playing", "paused"):
+            # Only fall back to device remote slot if no specific physical/retail cardId is present
+            if not slot and (not card_id or card_id in ("none", "")) and ev.get("playbackStatus") in ("playing", "paused"):
                 slot = br.store.remote_for(did)
+
             if slot:
                 item_id = slot.item_id or None
                 off = slot.offline or {}
@@ -769,15 +775,49 @@ async def api_status(request):
                         position = round(off["last_pos"])
                 else:
                     now_playing = slot.title or slot.yoto_title or slot.series_name
-                    # Try to get position from MQTT event
                     if ev.get("position") is not None:
                         position = round(float(ev["position"]))
                 if not playing_speed and slot.speed:
                     playing_speed = slot.speed
+            elif card_id and card_id not in ("none", ""):
+                # Retail or native Yoto card active! Resolve from cache or query Yoto card_detail
+                item_id = card_id
+                if ev.get("position") is not None:
+                    position = round(float(ev["position"]))
+                if ev.get("trackLength") is not None:
+                    duration = round(float(ev["trackLength"]))
+
+                card_info = br._yoto_card_cache.get(card_id)
+                if not card_info:
+                    try:
+                        card_info = await br.yoto.card_detail(card_id)
+                        if card_info:
+                            br._yoto_card_cache[card_id] = card_info
+                    except Exception as ce:
+                        log.debug("Yoto card_detail lookup notice for %s: %s", card_id, ce)
+
+                if card_info:
+                    now_playing = card_info.get("title") or "Yoto Card"
+                    meta = card_info.get("metadata") or {}
+                    author = meta.get("author") or meta.get("authorName")
+                    cover = meta.get("cover") or card_info.get("content", {}).get("cover") or {}
+                    cover_url = cover.get("imageL") or cover.get("imageM")
+                    if not duration and meta.get("media", {}).get("duration"):
+                        duration = round(float(meta["media"]["duration"]))
+
+                    # Resolve specific chapter title if not in MQTT event
+                    if not chapter_title:
+                        chs = card_info.get("content", {}).get("chapters", [])
+                        ch_match = next((c for c in chs if str(c.get("key")) == str(ev.get("chapterKey"))), None)
+                        if ch_match:
+                            chapter_title = ch_match.get("title")
+                else:
+                    now_playing = "Yoto Card"
 
         devices.append({"id": did, "name": br.device_name(did), "online": d.get("online"),
                         "status": ev.get("playbackStatus"),
                         "now_playing": now_playing, "item_id": item_id,
+                        "author": author, "chapter_title": chapter_title, "cover_url": cover_url,
                         "position": position,
                         "duration": duration,
                         "speed": float(br.store.state.speeds.get(did, 1.0)),
@@ -1877,4 +1917,3 @@ def make_app(br: Bridge) -> web.Application:
     chapter_api.register(app, br, require_pin)
     transfer.register(app, br, require_pin, _point_card)
     return app
-
